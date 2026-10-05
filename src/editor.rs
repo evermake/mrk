@@ -1,0 +1,2280 @@
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use gpui::{
+    AnyElement, App, Bounds, ClipboardItem, Context, EntityInputHandler, FocusHandle, Focusable,
+    Font, FontStyle, FontWeight, KeyBinding, KeyContext, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollHandle, SharedString, StrikethroughStyle,
+    StyledText, Task, TextRun, UTF16Selection, UnderlineStyle, Window, canvas, div, fill, point,
+    prelude::*, px,
+};
+use unicode_segmentation::UnicodeSegmentation;
+
+use crate::block_text::{BlockLayout, BlockText, Caret, LayoutMap};
+use crate::document::{Block, BlockId, BlockKind, Document, Row};
+use crate::markdown;
+use crate::rich_text::{InlineStyle, Mark, RichText};
+use crate::theme::{MONO_FONT, Theme, UI_FONT};
+
+#[cfg(test)]
+mod tests;
+
+/// The actions live in their own module because one of them is named `Copy`, which would
+/// otherwise shadow the trait of that name throughout this file.
+pub mod actions {
+    gpui::actions!(
+        editor,
+        [
+            MoveUp,
+            MoveDown,
+            MoveLeft,
+            MoveRight,
+            SelectUp,
+            SelectDown,
+            SelectLeft,
+            SelectRight,
+            MoveWordLeft,
+            MoveWordRight,
+            SelectWordLeft,
+            SelectWordRight,
+            MoveToLineStart,
+            MoveToLineEnd,
+            SelectToLineStart,
+            SelectToLineEnd,
+            Enter,
+            LineBreak,
+            NewBlockBelow,
+            OpenBelow,
+            OpenAbove,
+            Escape,
+            Backspace,
+            Delete,
+            DeleteWordBackward,
+            DeleteToLineStart,
+            Indent,
+            Outdent,
+            MoveBlocksUp,
+            MoveBlocksDown,
+            SelectAll,
+            Copy,
+            Cut,
+            Paste,
+            Undo,
+            Redo,
+            ToggleBold,
+            ToggleItalic,
+            ToggleCode,
+            ToggleStrikethrough,
+        ]
+    );
+}
+
+use actions::{
+    Backspace, Cut, Delete, DeleteToLineStart, DeleteWordBackward, Enter, Escape, Indent,
+    LineBreak, MoveBlocksDown, MoveBlocksUp, MoveDown, MoveLeft, MoveRight, MoveToLineEnd,
+    MoveToLineStart, MoveUp, MoveWordLeft, MoveWordRight, NewBlockBelow, OpenAbove, OpenBelow,
+    Outdent, Paste, Redo, SelectAll, SelectDown, SelectLeft, SelectRight, SelectToLineEnd,
+    SelectToLineStart, SelectUp, SelectWordLeft, SelectWordRight, ToggleBold, ToggleCode,
+    ToggleItalic, ToggleStrikethrough, Undo,
+};
+
+const KEY_CONTEXT: &str = "Editor";
+/// The Vim-style keys must stay out of writing mode, where they are text.
+const NOT_WRITING: &str = "Editor && mode != writing";
+
+pub fn bind_keys(cx: &mut App) {
+    let editor = Some(KEY_CONTEXT);
+    let not_writing = Some(NOT_WRITING);
+    cx.bind_keys([
+        KeyBinding::new("up", MoveUp, editor),
+        KeyBinding::new("down", MoveDown, editor),
+        KeyBinding::new("left", MoveLeft, editor),
+        KeyBinding::new("right", MoveRight, editor),
+        KeyBinding::new("shift-up", SelectUp, editor),
+        KeyBinding::new("shift-down", SelectDown, editor),
+        KeyBinding::new("shift-left", SelectLeft, editor),
+        KeyBinding::new("shift-right", SelectRight, editor),
+        KeyBinding::new("alt-up", MoveBlocksUp, editor),
+        KeyBinding::new("alt-down", MoveBlocksDown, editor),
+        KeyBinding::new("k", MoveUp, not_writing),
+        KeyBinding::new("j", MoveDown, not_writing),
+        KeyBinding::new("h", MoveLeft, not_writing),
+        KeyBinding::new("l", MoveRight, not_writing),
+        KeyBinding::new("shift-k", SelectUp, not_writing),
+        KeyBinding::new("shift-j", SelectDown, not_writing),
+        KeyBinding::new("shift-h", SelectLeft, not_writing),
+        KeyBinding::new("shift-l", SelectRight, not_writing),
+        KeyBinding::new("alt-k", MoveBlocksUp, not_writing),
+        KeyBinding::new("alt-j", MoveBlocksDown, not_writing),
+        KeyBinding::new("d", Backspace, not_writing),
+        KeyBinding::new("o", OpenBelow, not_writing),
+        KeyBinding::new("shift-o", OpenAbove, not_writing),
+        KeyBinding::new("alt-left", MoveWordLeft, editor),
+        KeyBinding::new("alt-right", MoveWordRight, editor),
+        KeyBinding::new("alt-shift-left", SelectWordLeft, editor),
+        KeyBinding::new("alt-shift-right", SelectWordRight, editor),
+        KeyBinding::new("cmd-left", MoveToLineStart, editor),
+        KeyBinding::new("cmd-right", MoveToLineEnd, editor),
+        KeyBinding::new("home", MoveToLineStart, editor),
+        KeyBinding::new("end", MoveToLineEnd, editor),
+        KeyBinding::new("ctrl-a", MoveToLineStart, editor),
+        KeyBinding::new("ctrl-e", MoveToLineEnd, editor),
+        KeyBinding::new("cmd-shift-left", SelectToLineStart, editor),
+        KeyBinding::new("cmd-shift-right", SelectToLineEnd, editor),
+        KeyBinding::new("shift-home", SelectToLineStart, editor),
+        KeyBinding::new("shift-end", SelectToLineEnd, editor),
+        KeyBinding::new("enter", Enter, editor),
+        KeyBinding::new("shift-enter", LineBreak, editor),
+        KeyBinding::new("cmd-enter", NewBlockBelow, editor),
+        KeyBinding::new("escape", Escape, editor),
+        KeyBinding::new("backspace", Backspace, editor),
+        KeyBinding::new("shift-backspace", Backspace, editor),
+        KeyBinding::new("delete", Delete, editor),
+        KeyBinding::new("alt-backspace", DeleteWordBackward, editor),
+        KeyBinding::new("cmd-backspace", DeleteToLineStart, editor),
+        KeyBinding::new("tab", Indent, editor),
+        KeyBinding::new("shift-tab", Outdent, editor),
+        KeyBinding::new("cmd-a", SelectAll, editor),
+        KeyBinding::new("cmd-c", actions::Copy, editor),
+        KeyBinding::new("cmd-x", Cut, editor),
+        KeyBinding::new("cmd-v", Paste, editor),
+        KeyBinding::new("cmd-z", Undo, editor),
+        KeyBinding::new("cmd-shift-z", Redo, editor),
+        KeyBinding::new("cmd-b", ToggleBold, editor),
+        KeyBinding::new("cmd-i", ToggleItalic, editor),
+        KeyBinding::new("cmd-e", ToggleCode, editor),
+        KeyBinding::new("cmd-shift-x", ToggleStrikethrough, editor),
+    ]);
+}
+
+const INDENT: Pixels = px(24.);
+const CONTENT_WIDTH: Pixels = px(760.);
+const SCROLL_MARGIN: Pixels = px(24.);
+const CODE_INDENT: &str = "    ";
+const BLINK_INTERVAL: Duration = Duration::from_millis(530);
+/// Consecutive typing within this interval is undone as one step.
+const UNDO_GROUP_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_UNDO_STEPS: usize = 500;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Nothing is selected, as when a document was just opened.
+    Idle,
+    Navigation,
+    Writing,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Selection {
+    None,
+    /// The siblings between `anchor` and `head`, each including its whole subtree. The two
+    /// always share a parent.
+    Blocks {
+        anchor: BlockId,
+        head: BlockId,
+    },
+    Text(TextSelection),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextSelection {
+    pub block: BlockId,
+    pub range: Range<usize>,
+    /// Whether the caret is at the start of the range rather than its end.
+    pub reversed: bool,
+}
+
+impl TextSelection {
+    fn caret(block: BlockId, offset: usize) -> Self {
+        Self {
+            block,
+            range: offset..offset,
+            reversed: false,
+        }
+    }
+
+    fn head(&self) -> usize {
+        if self.reversed {
+            self.range.start
+        } else {
+            self.range.end
+        }
+    }
+
+    fn tail(&self) -> usize {
+        if self.reversed {
+            self.range.end
+        } else {
+            self.range.start
+        }
+    }
+
+    fn with_head(&self, head: usize) -> Self {
+        let tail = self.tail();
+        Self {
+            block: self.block,
+            range: tail.min(head)..tail.max(head),
+            reversed: head < tail,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditKind {
+    Typing,
+    Deleting,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Direction {
+    Backward,
+    Forward,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unit {
+    Character,
+    Word,
+    Line,
+}
+
+struct Snapshot {
+    document: Document,
+    selection: Selection,
+    revision: u64,
+}
+
+#[derive(Default)]
+struct History {
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
+    /// The kind, block and time of the last edit, to group runs of typing into one step.
+    last_edit: Option<(EditKind, BlockId, Instant)>,
+}
+
+pub struct Editor {
+    document: Document,
+    selection: Selection,
+    /// The text being composed by an input method, within the block being written in.
+    marked_range: Option<Range<usize>>,
+    /// The style for the next typed text, set by toggling a mark with nothing selected.
+    pending_style: Option<InlineStyle>,
+    /// The window x coordinate the caret keeps to while moving vertically.
+    goal_x: Option<Pixels>,
+    /// At a soft wrap, whether the caret is at the end of the upper row.
+    caret_upstream: bool,
+    history: History,
+    revision: u64,
+    saved_revision: u64,
+    last_revision: u64,
+    layouts: LayoutMap,
+    scroll_handle: ScrollHandle,
+    focus_handle: FocusHandle,
+    needs_autoscroll: bool,
+    is_selecting: bool,
+    caret_visible: bool,
+    blink_task: Option<Task<()>>,
+}
+
+impl Focusable for Editor {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Editor {
+    pub fn new(document: Document, cx: &mut Context<Self>) -> Self {
+        Self {
+            document,
+            selection: Selection::None,
+            marked_range: None,
+            pending_style: None,
+            goal_x: None,
+            caret_upstream: false,
+            history: History::default(),
+            revision: 0,
+            saved_revision: 0,
+            last_revision: 0,
+            layouts: Rc::new(RefCell::new(HashMap::new())),
+            scroll_handle: ScrollHandle::new(),
+            focus_handle: cx.focus_handle(),
+            needs_autoscroll: false,
+            is_selecting: false,
+            caret_visible: true,
+            blink_task: None,
+        }
+    }
+
+    pub fn document(&self) -> &Document {
+        &self.document
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.revision != self.saved_revision
+    }
+
+    /// Identifies the current content, to tell [`Self::mark_saved`] what was written.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Records that the content as of `revision` is what is on disk. Edits made while the
+    /// file was being written keep the document dirty.
+    pub fn mark_saved(&mut self, revision: u64, cx: &mut Context<Self>) {
+        self.saved_revision = revision;
+        cx.notify();
+    }
+
+    pub fn mode(&self) -> Mode {
+        match self.selection {
+            Selection::None => Mode::Idle,
+            Selection::Blocks { .. } => Mode::Navigation,
+            Selection::Text(_) => Mode::Writing,
+        }
+    }
+
+    fn text_selection(&self) -> Option<&TextSelection> {
+        match &self.selection {
+            Selection::Text(selection) => Some(selection),
+            _ => None,
+        }
+    }
+
+    /// The siblings the current selection acts on as blocks: the selected blocks, or the
+    /// block being written in.
+    fn block_range(&self) -> Option<(BlockId, BlockId)> {
+        match &self.selection {
+            Selection::None => None,
+            Selection::Blocks { anchor, head } => Some((*anchor, *head)),
+            Selection::Text(selection) => Some((selection.block, selection.block)),
+        }
+    }
+
+    fn active_text(&self) -> Option<&RichText> {
+        let selection = self.text_selection()?;
+        self.document
+            .block(selection.block)
+            .map(|block| &block.text)
+    }
+
+    fn set_selection(&mut self, selection: Selection, cx: &mut Context<Self>) {
+        self.selection = selection;
+        self.marked_range = None;
+        self.pending_style = None;
+        self.goal_x = None;
+        self.caret_upstream = false;
+        self.history.last_edit = None;
+        self.selection_changed(cx);
+    }
+
+    fn selection_changed(&mut self, cx: &mut Context<Self>) {
+        self.needs_autoscroll = true;
+        self.restart_blink(cx);
+        cx.notify();
+    }
+
+    fn select_block(&mut self, block: BlockId, cx: &mut Context<Self>) {
+        self.set_selection(
+            Selection::Blocks {
+                anchor: block,
+                head: block,
+            },
+            cx,
+        );
+    }
+
+    fn set_caret(&mut self, block: BlockId, offset: usize, cx: &mut Context<Self>) {
+        self.set_selection(Selection::Text(TextSelection::caret(block, offset)), cx);
+    }
+
+    /// Enters writing mode at the end of `block`. A divider has no text to write in, so a
+    /// paragraph is added below it instead.
+    fn start_writing(&mut self, block: BlockId, cx: &mut Context<Self>) {
+        let Some(target) = self.document.block(block) else {
+            return;
+        };
+        if target.kind.has_text() {
+            let offset = target.text.len();
+            self.set_caret(block, offset, cx);
+        } else {
+            self.write_in_new_block(block, Direction::Forward, BlockKind::Paragraph, cx);
+        }
+    }
+
+    /// Adds an empty block of `kind` right before or after `neighbor`, at its nesting level,
+    /// and starts writing in it.
+    fn write_in_new_block(
+        &mut self,
+        neighbor: BlockId,
+        direction: Direction,
+        kind: BlockKind,
+        cx: &mut Context<Self>,
+    ) {
+        self.transact(EditKind::Other, cx, |this| {
+            let block = Block::new(kind, RichText::new());
+            let inserted = match direction {
+                Direction::Backward => this.document.insert_before(neighbor, vec![block]),
+                Direction::Forward => this.document.insert_after(neighbor, vec![block]),
+            };
+            match inserted.first() {
+                Some(&block) => {
+                    this.selection = Selection::Text(TextSelection::caret(block, 0));
+                    true
+                }
+                None => false,
+            }
+        });
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            document: self.document.clone(),
+            selection: self.selection.clone(),
+            revision: self.revision,
+        }
+    }
+
+    /// Runs an edit as one undoable step. `edit` returns whether it changed anything; when it
+    /// did not, nothing is recorded.
+    fn transact(
+        &mut self,
+        kind: EditKind,
+        cx: &mut Context<Self>,
+        edit: impl FnOnce(&mut Self) -> bool,
+    ) -> bool {
+        let before = self.snapshot();
+        let block = self.text_selection().map(|selection| selection.block);
+        if !edit(self) {
+            return false;
+        }
+        let now = Instant::now();
+        let continues_last_edit = kind != EditKind::Other
+            && self
+                .history
+                .last_edit
+                .is_some_and(|(last_kind, last_block, time)| {
+                    last_kind == kind
+                        && Some(last_block) == block
+                        && now.duration_since(time) < UNDO_GROUP_INTERVAL
+                });
+        if !continues_last_edit {
+            self.history.undo.push(before);
+            if self.history.undo.len() > MAX_UNDO_STEPS {
+                self.history.undo.remove(0);
+            }
+        }
+        self.history.redo.clear();
+        self.history.last_edit = match (kind, block) {
+            (EditKind::Other, _) | (_, None) => None,
+            (kind, Some(block)) => Some((kind, block, now)),
+        };
+        self.last_revision += 1;
+        self.revision = self.last_revision;
+        self.goal_x = None;
+        self.caret_upstream = false;
+        self.selection_changed(cx);
+        true
+    }
+
+    fn restore(&mut self, snapshot: Snapshot, cx: &mut Context<Self>) {
+        self.document = snapshot.document;
+        self.revision = snapshot.revision;
+        self.set_selection(snapshot.selection, cx);
+    }
+
+    fn undo(&mut self, _: &Undo, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(snapshot) = self.history.undo.pop() {
+            let current = self.snapshot();
+            self.history.redo.push(current);
+            self.restore(snapshot, cx);
+        }
+    }
+
+    fn redo(&mut self, _: &Redo, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(snapshot) = self.history.redo.pop() {
+            let current = self.snapshot();
+            self.history.undo.push(current);
+            self.restore(snapshot, cx);
+        }
+    }
+
+    fn restart_blink(&mut self, cx: &mut Context<Self>) {
+        self.caret_visible = true;
+        if self.mode() != Mode::Writing {
+            self.blink_task = None;
+            return;
+        }
+        self.blink_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(BLINK_INTERVAL).await;
+                let updated = this.update(cx, |this, cx| {
+                    this.caret_visible = !this.caret_visible;
+                    cx.notify();
+                });
+                if updated.is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    fn move_up(&mut self, _: &MoveUp, _window: &mut Window, cx: &mut Context<Self>) {
+        match self.selection.clone() {
+            Selection::None => self.select_block(self.document.last(), cx),
+            Selection::Blocks { head, .. } => {
+                let target = self.document.previous(head).unwrap_or(head);
+                self.select_block(target, cx);
+            }
+            Selection::Text(_) => self.move_caret_vertically(Direction::Backward, false, cx),
+        }
+    }
+
+    fn move_down(&mut self, _: &MoveDown, _window: &mut Window, cx: &mut Context<Self>) {
+        match self.selection.clone() {
+            Selection::None => self.select_block(self.document.first(), cx),
+            Selection::Blocks { head, .. } => {
+                let target = self.document.next(head).unwrap_or(head);
+                self.select_block(target, cx);
+            }
+            Selection::Text(_) => self.move_caret_vertically(Direction::Forward, false, cx),
+        }
+    }
+
+    fn move_left(&mut self, _: &MoveLeft, _window: &mut Window, cx: &mut Context<Self>) {
+        match self.selection.clone() {
+            Selection::None => {}
+            Selection::Blocks { head, .. } => {
+                if let Some(parent) = self.document.parent(head) {
+                    self.select_block(parent, cx);
+                }
+            }
+            Selection::Text(_) => self.move_caret(Direction::Backward, Unit::Character, false, cx),
+        }
+    }
+
+    fn move_right(&mut self, _: &MoveRight, _window: &mut Window, cx: &mut Context<Self>) {
+        match self.selection.clone() {
+            Selection::None => {}
+            Selection::Blocks { head, .. } => {
+                if let Some(child) = self.document.first_child(head) {
+                    self.select_block(child, cx);
+                }
+            }
+            Selection::Text(_) => self.move_caret(Direction::Forward, Unit::Character, false, cx),
+        }
+    }
+
+    fn select_up(&mut self, _: &SelectUp, _window: &mut Window, cx: &mut Context<Self>) {
+        match self.selection.clone() {
+            Selection::None => self.select_block(self.document.last(), cx),
+            Selection::Blocks { anchor, head } => {
+                if let Some(head) = self.document.previous_sibling(head) {
+                    self.set_selection(Selection::Blocks { anchor, head }, cx);
+                }
+            }
+            Selection::Text(_) => self.move_caret_vertically(Direction::Backward, true, cx),
+        }
+    }
+
+    fn select_down(&mut self, _: &SelectDown, _window: &mut Window, cx: &mut Context<Self>) {
+        match self.selection.clone() {
+            Selection::None => self.select_block(self.document.first(), cx),
+            Selection::Blocks { anchor, head } => {
+                if let Some(head) = self.document.next_sibling(head) {
+                    self.set_selection(Selection::Blocks { anchor, head }, cx);
+                }
+            }
+            Selection::Text(_) => self.move_caret_vertically(Direction::Forward, true, cx),
+        }
+    }
+
+    fn select_left(&mut self, _: &SelectLeft, _window: &mut Window, cx: &mut Context<Self>) {
+        self.move_caret(Direction::Backward, Unit::Character, true, cx);
+    }
+
+    fn select_right(&mut self, _: &SelectRight, _window: &mut Window, cx: &mut Context<Self>) {
+        self.move_caret(Direction::Forward, Unit::Character, true, cx);
+    }
+
+    fn move_word_left(&mut self, _: &MoveWordLeft, _window: &mut Window, cx: &mut Context<Self>) {
+        self.move_caret(Direction::Backward, Unit::Word, false, cx);
+    }
+
+    fn move_word_right(&mut self, _: &MoveWordRight, _window: &mut Window, cx: &mut Context<Self>) {
+        self.move_caret(Direction::Forward, Unit::Word, false, cx);
+    }
+
+    fn select_word_left(
+        &mut self,
+        _: &SelectWordLeft,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_caret(Direction::Backward, Unit::Word, true, cx);
+    }
+
+    fn select_word_right(
+        &mut self,
+        _: &SelectWordRight,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_caret(Direction::Forward, Unit::Word, true, cx);
+    }
+
+    fn move_to_line_start(
+        &mut self,
+        _: &MoveToLineStart,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_caret(Direction::Backward, Unit::Line, false, cx);
+    }
+
+    fn move_to_line_end(
+        &mut self,
+        _: &MoveToLineEnd,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_caret(Direction::Forward, Unit::Line, false, cx);
+    }
+
+    fn select_to_line_start(
+        &mut self,
+        _: &SelectToLineStart,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_caret(Direction::Backward, Unit::Line, true, cx);
+    }
+
+    fn select_to_line_end(
+        &mut self,
+        _: &SelectToLineEnd,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_caret(Direction::Forward, Unit::Line, true, cx);
+    }
+
+    /// The offset reached from `offset` by moving one `unit` within the block's text, and
+    /// whether the caret then sits on the upstream side of a soft wrap.
+    fn offset_after_move(
+        &self,
+        selection: &TextSelection,
+        direction: Direction,
+        unit: Unit,
+    ) -> (usize, bool) {
+        let Some(text) = self
+            .document
+            .block(selection.block)
+            .map(|block| block.text.text())
+        else {
+            return (selection.head(), false);
+        };
+        let offset = selection.head();
+        match (unit, direction) {
+            (Unit::Character, Direction::Backward) => (previous_grapheme(text, offset), false),
+            (Unit::Character, Direction::Forward) => (next_grapheme(text, offset), false),
+            (Unit::Word, Direction::Backward) => (previous_word_start(text, offset), false),
+            (Unit::Word, Direction::Forward) => (next_word_end(text, offset), false),
+            (Unit::Line, _) => {
+                let layouts = self.layouts.borrow();
+                let Some(layout) = layouts.get(&selection.block) else {
+                    return match direction {
+                        Direction::Backward => (0, false),
+                        Direction::Forward => (text.len(), false),
+                    };
+                };
+                let rows = layout.rows();
+                let Some(row) = rows.get(layout.row_index(&rows, offset, self.caret_upstream))
+                else {
+                    return (offset, false);
+                };
+                match direction {
+                    Direction::Backward => (row.range.start, false),
+                    Direction::Forward => (row.range.end, row.wraps),
+                }
+            }
+        }
+    }
+
+    fn move_caret(
+        &mut self,
+        direction: Direction,
+        unit: Unit,
+        extend: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(selection) = self.text_selection().cloned() else {
+            return;
+        };
+        if extend {
+            let (head, upstream) = self.offset_after_move(&selection, direction, unit);
+            self.set_selection(Selection::Text(selection.with_head(head)), cx);
+            self.caret_upstream = upstream;
+            return;
+        }
+        if unit == Unit::Character && !selection.range.is_empty() {
+            let offset = match direction {
+                Direction::Backward => selection.range.start,
+                Direction::Forward => selection.range.end,
+            };
+            self.set_caret(selection.block, offset, cx);
+            return;
+        }
+        let (offset, upstream) = self.offset_after_move(&selection, direction, unit);
+        if offset != selection.head() || unit == Unit::Line {
+            self.set_caret(selection.block, offset, cx);
+            self.caret_upstream = upstream;
+            return;
+        }
+        // At the edge of the block, the caret continues into the neighboring one.
+        match direction {
+            Direction::Backward => {
+                if let Some(block) = self.adjacent_text_block(selection.block, direction) {
+                    let end = self
+                        .document
+                        .block(block)
+                        .map_or(0, |block| block.text.len());
+                    self.set_caret(block, end, cx);
+                }
+            }
+            Direction::Forward => {
+                if let Some(block) = self.adjacent_text_block(selection.block, direction) {
+                    self.set_caret(block, 0, cx);
+                }
+            }
+        }
+    }
+
+    /// The nearest block with text above or below `block` in document order.
+    fn adjacent_text_block(&self, block: BlockId, direction: Direction) -> Option<BlockId> {
+        let mut current = block;
+        loop {
+            current = match direction {
+                Direction::Backward => self.document.previous(current)?,
+                Direction::Forward => self.document.next(current)?,
+            };
+            if self.document.block(current)?.kind.has_text() {
+                return Some(current);
+            }
+        }
+    }
+
+    fn move_caret_vertically(
+        &mut self,
+        direction: Direction,
+        extend: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(selection) = self.text_selection().cloned() else {
+            return;
+        };
+        let text_length = self
+            .document
+            .block(selection.block)
+            .map_or(0, |block| block.text.len());
+        let block_edge = match direction {
+            Direction::Backward => 0,
+            Direction::Forward => text_length,
+        };
+
+        let layouts = self.layouts.borrow().clone();
+        let Some(layout) = layouts.get(&selection.block) else {
+            // Without a layout (nothing was painted yet) rows are unknown, so the caret moves
+            // by whole blocks.
+            let target = self.adjacent_text_block(selection.block, direction);
+            match target {
+                Some(block) if !extend => {
+                    let offset = match direction {
+                        Direction::Backward => self
+                            .document
+                            .block(block)
+                            .map_or(0, |block| block.text.len()),
+                        Direction::Forward => 0,
+                    };
+                    self.set_caret(block, offset, cx);
+                }
+                _ => self.set_selection(
+                    Selection::Text(if extend {
+                        selection.with_head(block_edge)
+                    } else {
+                        TextSelection::caret(selection.block, block_edge)
+                    }),
+                    cx,
+                ),
+            }
+            return;
+        };
+
+        let rows = layout.rows();
+        let row_index = layout.row_index(&rows, selection.head(), self.caret_upstream);
+        let goal_x = self.goal_x.unwrap_or_else(|| {
+            rows.get(row_index).map_or(layout.bounds.left(), |row| {
+                layout.bounds.left() + layout.x_in_row(row, selection.head())
+            })
+        });
+        let target_row = match direction {
+            Direction::Backward => row_index.checked_sub(1),
+            Direction::Forward => Some(row_index + 1).filter(|index| *index < rows.len()),
+        };
+
+        if let Some(row) = target_row.and_then(|index| rows.get(index)) {
+            let (offset, upstream) = layout.offset_in_row(row, goal_x - layout.bounds.left());
+            let selection = if extend {
+                selection.with_head(offset)
+            } else {
+                TextSelection::caret(selection.block, offset)
+            };
+            self.set_selection(Selection::Text(selection), cx);
+            self.caret_upstream = upstream;
+            self.goal_x = Some(goal_x);
+            return;
+        }
+
+        // A text selection stays within its block, so extending past the first or last row
+        // selects up to the edge of the block.
+        let neighbor = if extend {
+            None
+        } else {
+            self.adjacent_text_block(selection.block, direction)
+        };
+        let Some(neighbor) = neighbor else {
+            let selection = if extend {
+                selection.with_head(block_edge)
+            } else {
+                TextSelection::caret(selection.block, block_edge)
+            };
+            self.set_selection(Selection::Text(selection), cx);
+            return;
+        };
+        let (offset, upstream) = match layouts.get(&neighbor) {
+            Some(neighbor_layout) => {
+                let rows = neighbor_layout.rows();
+                let row = match direction {
+                    Direction::Backward => rows.last(),
+                    Direction::Forward => rows.first(),
+                };
+                row.map_or((0, false), |row| {
+                    neighbor_layout.offset_in_row(row, goal_x - neighbor_layout.bounds.left())
+                })
+            }
+            None => (0, false),
+        };
+        self.set_caret(neighbor, offset, cx);
+        self.caret_upstream = upstream;
+        self.goal_x = Some(goal_x);
+    }
+
+    fn escape(&mut self, _: &Escape, _window: &mut Window, cx: &mut Context<Self>) {
+        match self.selection.clone() {
+            Selection::None => {}
+            Selection::Blocks { .. } => self.set_selection(Selection::None, cx),
+            Selection::Text(selection) => self.select_block(selection.block, cx),
+        }
+    }
+
+    fn enter(&mut self, _: &Enter, _window: &mut Window, cx: &mut Context<Self>) {
+        match self.selection.clone() {
+            Selection::None => self.start_writing(self.document.last(), cx),
+            Selection::Blocks { head, .. } => self.start_writing(head, cx),
+            Selection::Text(selection) => self.newline(selection, cx),
+        }
+    }
+
+    fn newline(&mut self, selection: TextSelection, cx: &mut Context<Self>) {
+        let Some(block) = self.document.block(selection.block) else {
+            return;
+        };
+        let id = selection.block;
+        let kind = block.kind.clone();
+        let text = block.text.text().to_string();
+
+        if kind.is_verbatim() {
+            self.insert_text(selection.range, "\n", cx);
+            return;
+        }
+        if kind == BlockKind::Paragraph
+            && let Some(language) = text.strip_prefix("```")
+            && !language.contains('`')
+        {
+            let language = language.trim().to_string();
+            self.transact(EditKind::Other, cx, |this| {
+                if let Some(block) = this.document.block_mut(id) {
+                    block.text = RichText::new();
+                }
+                this.selection = Selection::Text(TextSelection::caret(id, 0));
+                this.document.set_kind(id, BlockKind::Code { language })
+            });
+            return;
+        }
+        if kind == BlockKind::Paragraph && matches!(text.as_str(), "---" | "***" | "___") {
+            self.transact(EditKind::Other, cx, |this| this.convert_to_divider(id));
+            return;
+        }
+        if text.is_empty() && kind != BlockKind::Paragraph {
+            // Enter on an empty item ends the list: the item moves out one level, and at the
+            // top level it becomes a plain paragraph.
+            self.transact(EditKind::Other, cx, |this| {
+                if kind.is_list_item() && this.document.parent(id).is_some() {
+                    this.document.outdent(id, id)
+                } else {
+                    this.document.set_kind(id, BlockKind::Paragraph)
+                }
+            });
+            return;
+        }
+        self.transact(EditKind::Other, cx, |this| {
+            if let Some(block) = this.document.block_mut(id) {
+                block.text.delete(selection.range.clone());
+            }
+            match this.document.split(id, selection.range.start) {
+                Some(caret_block) => {
+                    this.selection = Selection::Text(TextSelection::caret(caret_block, 0));
+                    true
+                }
+                None => false,
+            }
+        });
+    }
+
+    /// Turns `block` into a divider and continues writing in a new paragraph below it.
+    fn convert_to_divider(&mut self, block: BlockId) -> bool {
+        if !self.document.set_kind(block, BlockKind::Divider) {
+            return false;
+        }
+        let paragraph = Block::paragraph(RichText::new());
+        match self.document.insert_after(block, vec![paragraph]).first() {
+            Some(&paragraph) => {
+                self.selection = Selection::Text(TextSelection::caret(paragraph, 0));
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn line_break(&mut self, _: &LineBreak, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(selection) = self.text_selection().cloned() else {
+            return;
+        };
+        let is_heading = self
+            .document
+            .block(selection.block)
+            .is_some_and(|block| matches!(block.kind, BlockKind::Heading(_)));
+        // A Markdown heading is a single line.
+        if !is_heading {
+            self.insert_text(selection.range, "\n", cx);
+        }
+    }
+
+    fn new_block_below(&mut self, _: &NewBlockBelow, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some((first, second)) = self.block_range() else {
+            return;
+        };
+        let Some(&last) = self.document.siblings_between(first, second).last() else {
+            return;
+        };
+        self.write_in_new_block(last, Direction::Forward, BlockKind::Paragraph, cx);
+    }
+
+    fn open_below(&mut self, _: &OpenBelow, _window: &mut Window, cx: &mut Context<Self>) {
+        self.open_block(Direction::Forward, cx);
+    }
+
+    fn open_above(&mut self, _: &OpenAbove, _window: &mut Window, cx: &mut Context<Self>) {
+        self.open_block(Direction::Backward, cx);
+    }
+
+    /// Adds an empty block below or above the selected blocks, at their nesting level, and
+    /// starts writing in it. The block carries on from the one it is added next to, so next
+    /// to a list item it is another item. With nothing selected it goes to the end or the
+    /// start of the document.
+    fn open_block(&mut self, direction: Direction, cx: &mut Context<Self>) {
+        let neighbor = match self.block_range() {
+            Some((first, second)) => {
+                let siblings = self.document.siblings_between(first, second);
+                match direction {
+                    Direction::Backward => siblings.first().copied(),
+                    Direction::Forward => siblings.last().copied(),
+                }
+            }
+            None => Some(match direction {
+                Direction::Backward => self.document.first(),
+                Direction::Forward => self.document.last_top_level(),
+            }),
+        };
+        let Some(neighbor) = neighbor else {
+            return;
+        };
+        let Some(kind) = self
+            .document
+            .block(neighbor)
+            .map(|block| block.kind.continuation())
+        else {
+            return;
+        };
+        self.write_in_new_block(neighbor, direction, kind, cx);
+    }
+
+    fn backspace(&mut self, _: &Backspace, _window: &mut Window, cx: &mut Context<Self>) {
+        self.delete_text(Direction::Backward, Unit::Character, cx);
+    }
+
+    fn delete(&mut self, _: &Delete, _window: &mut Window, cx: &mut Context<Self>) {
+        self.delete_text(Direction::Forward, Unit::Character, cx);
+    }
+
+    fn delete_word_backward(
+        &mut self,
+        _: &DeleteWordBackward,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.delete_text(Direction::Backward, Unit::Word, cx);
+    }
+
+    fn delete_to_line_start(
+        &mut self,
+        _: &DeleteToLineStart,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.delete_text(Direction::Backward, Unit::Line, cx);
+    }
+
+    fn delete_text(&mut self, direction: Direction, unit: Unit, cx: &mut Context<Self>) {
+        let selection = match self.selection.clone() {
+            Selection::None => return,
+            Selection::Blocks { anchor, head } => {
+                self.transact(EditKind::Other, cx, |this| {
+                    match this.document.delete(anchor, head) {
+                        Some(block) => {
+                            this.selection = Selection::Blocks {
+                                anchor: block,
+                                head: block,
+                            };
+                            true
+                        }
+                        None => false,
+                    }
+                });
+                return;
+            }
+            Selection::Text(selection) => selection,
+        };
+        let id = selection.block;
+        let range = if selection.range.is_empty() {
+            let (target, _) = self.offset_after_move(&selection, direction, unit);
+            target.min(selection.head())..target.max(selection.head())
+        } else {
+            selection.range.clone()
+        };
+        if !range.is_empty() {
+            self.transact(EditKind::Deleting, cx, |this| {
+                let Some(block) = this.document.block_mut(id) else {
+                    return false;
+                };
+                block.text.delete(range.clone());
+                this.selection = Selection::Text(TextSelection::caret(id, range.start));
+                true
+            });
+            return;
+        }
+
+        // Nothing left to delete inside the block, so the block itself gives way.
+        match direction {
+            Direction::Backward => {
+                let is_paragraph = self
+                    .document
+                    .block(id)
+                    .is_some_and(|block| block.kind == BlockKind::Paragraph);
+                self.transact(EditKind::Other, cx, |this| {
+                    if !is_paragraph {
+                        return this.document.set_kind(id, BlockKind::Paragraph);
+                    }
+                    match this.document.merge_into_previous(id) {
+                        Some((block, offset)) => {
+                            this.selection = Selection::Text(TextSelection::caret(block, offset));
+                            true
+                        }
+                        None => false,
+                    }
+                });
+            }
+            Direction::Forward => {
+                self.transact(EditKind::Other, cx, |this| this.document.merge_next(id));
+            }
+        }
+    }
+
+    fn indent(&mut self, _: &Indent, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(selection) = self.text_selection().cloned()
+            && self.is_verbatim(selection.block)
+        {
+            self.insert_text(selection.range, CODE_INDENT, cx);
+            return;
+        }
+        if let Some((first, second)) = self.block_range() {
+            self.transact(EditKind::Other, cx, |this| {
+                this.document.indent(first, second)
+            });
+        }
+    }
+
+    fn outdent(&mut self, _: &Outdent, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((first, second)) = self.block_range() {
+            self.transact(EditKind::Other, cx, |this| {
+                this.document.outdent(first, second)
+            });
+        }
+    }
+
+    fn move_blocks_up(&mut self, _: &MoveBlocksUp, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((first, second)) = self.block_range() {
+            self.transact(EditKind::Other, cx, |this| {
+                this.document.move_up(first, second)
+            });
+        }
+    }
+
+    fn move_blocks_down(
+        &mut self,
+        _: &MoveBlocksDown,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((first, second)) = self.block_range() {
+            self.transact(EditKind::Other, cx, |this| {
+                this.document.move_down(first, second)
+            });
+        }
+    }
+
+    fn select_all(&mut self, _: &SelectAll, _window: &mut Window, cx: &mut Context<Self>) {
+        match self.selection.clone() {
+            Selection::Text(selection) => {
+                let length = self
+                    .document
+                    .block(selection.block)
+                    .map_or(0, |block| block.text.len());
+                self.set_selection(
+                    Selection::Text(TextSelection {
+                        block: selection.block,
+                        range: 0..length,
+                        reversed: false,
+                    }),
+                    cx,
+                );
+            }
+            Selection::None | Selection::Blocks { .. } => {
+                let blocks = self.document.blocks();
+                if let (Some(first), Some(last)) = (blocks.first(), blocks.last()) {
+                    self.set_selection(
+                        Selection::Blocks {
+                            anchor: first.id,
+                            head: last.id,
+                        },
+                        cx,
+                    );
+                }
+            }
+        }
+    }
+
+    fn is_verbatim(&self, block: BlockId) -> bool {
+        self.document
+            .block(block)
+            .is_some_and(|block| block.kind.is_verbatim())
+    }
+
+    /// Replaces `range` of the block being written in with `text`, as typing does.
+    fn insert_text(&mut self, range: Range<usize>, text: &str, cx: &mut Context<Self>) {
+        let Some(selection) = self.text_selection().cloned() else {
+            return;
+        };
+        let id = selection.block;
+        let pending_style = self.pending_style.take();
+        let kind = if text.is_empty() {
+            EditKind::Deleting
+        } else {
+            EditKind::Typing
+        };
+        let changed = self.transact(kind, cx, |this| {
+            let Some(block) = this.document.block_mut(id) else {
+                return false;
+            };
+            if range.is_empty() && text.is_empty() {
+                return false;
+            }
+            let style = if block.kind.is_verbatim() {
+                InlineStyle::default()
+            } else if let Some(style) = pending_style {
+                style
+            } else if range.is_empty() {
+                block.text.typing_style(range.start)
+            } else {
+                // Typing over a selection continues the style the selection started with.
+                block
+                    .text
+                    .style_at(range.start)
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            let range = block.text.clamp(range.start)..block.text.clamp(range.end);
+            block.text.replace(range.clone(), text, style);
+            let caret = range.start + text.len();
+            this.selection = Selection::Text(TextSelection::caret(id, caret));
+            true
+        });
+        if changed && text == " " {
+            self.apply_typing_shortcut(id, cx);
+        }
+    }
+
+    /// Converts the block when the text typed at its start is a Markdown block marker, e.g.
+    /// `# ` for a heading. It is its own undo step, so undoing brings the typed marker back.
+    fn apply_typing_shortcut(&mut self, id: BlockId, cx: &mut Context<Self>) {
+        let Some(selection) = self.text_selection().cloned() else {
+            return;
+        };
+        let Some(block) = self.document.block(id) else {
+            return;
+        };
+        let caret = selection.head();
+        let Some(marker) = block.text.text()[..caret].strip_suffix(' ') else {
+            return;
+        };
+        let Some(kind) = shortcut_kind(marker, &block.kind) else {
+            return;
+        };
+        self.transact(EditKind::Other, cx, |this| {
+            if let Some(block) = this.document.block_mut(id) {
+                block.text.delete(0..caret);
+            }
+            if kind == BlockKind::Divider {
+                return this.convert_to_divider(id);
+            }
+            this.selection = Selection::Text(TextSelection::caret(id, 0));
+            this.document.set_kind(id, kind)
+        });
+    }
+
+    fn toggle_bold(&mut self, _: &ToggleBold, _window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_mark(Mark::Bold, cx);
+    }
+
+    fn toggle_italic(&mut self, _: &ToggleItalic, _window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_mark(Mark::Italic, cx);
+    }
+
+    fn toggle_code(&mut self, _: &ToggleCode, _window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_mark(Mark::Code, cx);
+    }
+
+    fn toggle_strikethrough(
+        &mut self,
+        _: &ToggleStrikethrough,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_mark(Mark::Strikethrough, cx);
+    }
+
+    fn toggle_mark(&mut self, mark: Mark, cx: &mut Context<Self>) {
+        let Some(selection) = self.text_selection().cloned() else {
+            return;
+        };
+        let Some(block) = self.document.block(selection.block) else {
+            return;
+        };
+        if block.kind.is_verbatim() {
+            return;
+        }
+        if selection.range.is_empty() {
+            let mut style = self
+                .pending_style
+                .take()
+                .unwrap_or_else(|| block.text.typing_style(selection.head()));
+            style.set(mark, !style.has(mark));
+            self.pending_style = Some(style);
+            cx.notify();
+            return;
+        }
+        self.transact(EditKind::Other, cx, |this| {
+            let Some(block) = this.document.block_mut(selection.block) else {
+                return false;
+            };
+            block.text.toggle_mark(selection.range.clone(), mark);
+            true
+        });
+    }
+
+    fn toggle_todo(&mut self, id: BlockId, cx: &mut Context<Self>) {
+        self.transact(EditKind::Other, cx, |this| {
+            match this.document.block_mut(id) {
+                Some(Block {
+                    kind: BlockKind::Todo { checked },
+                    ..
+                }) => {
+                    *checked = !*checked;
+                    true
+                }
+                _ => false,
+            }
+        });
+    }
+
+    fn copy(&mut self, _: &actions::Copy, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = self.selected_content() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    fn cut(&mut self, _: &Cut, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = self.selected_content() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            self.delete_text(Direction::Backward, Unit::Character, cx);
+        }
+    }
+
+    /// What copying the selection puts on the clipboard: the plain selected text in writing
+    /// mode, and the selected blocks as Markdown in navigation mode.
+    fn selected_content(&self) -> Option<String> {
+        match &self.selection {
+            Selection::None => None,
+            Selection::Blocks { anchor, head } => {
+                let blocks = self.document.blocks_between(*anchor, *head);
+                Some(markdown::serialize_blocks(&blocks))
+            }
+            Selection::Text(selection) => {
+                let text = self.document.block(selection.block)?.text.text();
+                (!selection.range.is_empty()).then(|| text[selection.range.clone()].to_string())
+            }
+        }
+    }
+
+    fn paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return;
+        };
+        match self.selection.clone() {
+            Selection::None => {}
+            Selection::Blocks { anchor, head } => self.paste_blocks(anchor, head, &text, cx),
+            Selection::Text(selection) => self.paste_text(selection, &text, cx),
+        }
+    }
+
+    fn paste_blocks(&mut self, anchor: BlockId, head: BlockId, text: &str, cx: &mut Context<Self>) {
+        let blocks = markdown::parse_blocks(text);
+        let Some(&last) = self.document.siblings_between(anchor, head).last() else {
+            return;
+        };
+        self.transact(EditKind::Other, cx, |this| {
+            let inserted = this.document.insert_after(last, blocks);
+            match (inserted.first(), inserted.last()) {
+                (Some(&first), Some(&last)) => {
+                    this.selection = Selection::Blocks {
+                        anchor: first,
+                        head: last,
+                    };
+                    true
+                }
+                _ => false,
+            }
+        });
+    }
+
+    fn paste_text(&mut self, selection: TextSelection, text: &str, cx: &mut Context<Self>) {
+        let id = selection.block;
+        if self.is_verbatim(id) {
+            self.insert_text(selection.range, text, cx);
+            return;
+        }
+        if !selection.range.is_empty()
+            && let Some(url) = pasted_url(text)
+        {
+            self.transact(EditKind::Other, cx, |this| {
+                let Some(block) = this.document.block_mut(id) else {
+                    return false;
+                };
+                block.text.set_link(selection.range.clone(), Some(url));
+                true
+            });
+            return;
+        }
+        if !text.trim_end_matches('\n').contains('\n') {
+            self.insert_text(selection.range, text.trim_end_matches('\n'), cx);
+            return;
+        }
+
+        let mut blocks = markdown::parse_blocks(text);
+        self.transact(EditKind::Other, cx, |this| {
+            let Some(block) = this.document.block_mut(id) else {
+                return false;
+            };
+            block.text.delete(selection.range.clone());
+            if let [single] = blocks.as_slice()
+                && single.kind == BlockKind::Paragraph
+            {
+                let inserted = blocks.remove(0).text;
+                let caret = selection.range.start + inserted.len();
+                block.text.insert_rich(selection.range.start, inserted);
+                this.selection = Selection::Text(TextSelection::caret(id, caret));
+                return true;
+            }
+            let replaces_empty_paragraph =
+                block.kind == BlockKind::Paragraph && block.text.is_empty();
+            let inserted = this.document.insert_after(id, blocks);
+            let Some(&last) = inserted.last() else {
+                return false;
+            };
+            if replaces_empty_paragraph {
+                this.document.remove(id);
+            }
+            this.selection = match this.document.block(last) {
+                Some(block) if block.kind.has_text() => {
+                    Selection::Text(TextSelection::caret(last, block.text.len()))
+                }
+                _ => Selection::Blocks {
+                    anchor: last,
+                    head: last,
+                },
+            };
+            true
+        });
+    }
+
+    /// The block whose painted text is at, or vertically closest to, `position`.
+    fn block_at(&self, position: Point<Pixels>) -> Option<(BlockId, BlockLayout)> {
+        let layouts = self.layouts.borrow();
+        layouts
+            .iter()
+            .min_by_key(|(_, layout)| {
+                if position.y < layout.bounds.top() {
+                    layout.bounds.top() - position.y
+                } else if position.y > layout.bounds.bottom() {
+                    position.y - layout.bounds.bottom()
+                } else {
+                    Pixels::ZERO
+                }
+            })
+            .map(|(id, layout)| (*id, layout.clone()))
+    }
+
+    fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus_handle, cx);
+        let Some((id, layout)) = self.block_at(event.position) else {
+            return;
+        };
+        let Some(block) = self.document.block(id) else {
+            return;
+        };
+        if !block.kind.has_text() {
+            self.select_block(id, cx);
+            return;
+        }
+        let (offset, upstream) = layout.offset_for_point(event.position);
+        if event.modifiers.platform
+            && let Some(link) = block.text.link_at(offset)
+        {
+            cx.open_url(link);
+            return;
+        }
+        let text = block.text.text();
+        let selection = match event.click_count {
+            1 => match self.text_selection() {
+                Some(selection) if event.modifiers.shift && selection.block == id => {
+                    selection.with_head(offset)
+                }
+                _ => TextSelection::caret(id, offset),
+            },
+            2 => {
+                let range = word_range(text, offset);
+                TextSelection {
+                    block: id,
+                    range,
+                    reversed: false,
+                }
+            }
+            _ => TextSelection {
+                block: id,
+                range: 0..text.len(),
+                reversed: false,
+            },
+        };
+        self.is_selecting = event.click_count == 1;
+        self.set_selection(Selection::Text(selection), cx);
+        self.caret_upstream = upstream;
+    }
+
+    fn mouse_move(&mut self, event: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_selecting || !event.dragging() {
+            return;
+        }
+        let Some(selection) = self.text_selection().cloned() else {
+            return;
+        };
+        let offset = {
+            let layouts = self.layouts.borrow();
+            let Some(layout) = layouts.get(&selection.block) else {
+                return;
+            };
+            layout.offset_for_point(event.position).0
+        };
+        if offset != selection.head() {
+            self.set_selection(Selection::Text(selection.with_head(offset)), cx);
+        }
+    }
+
+    fn mouse_up(&mut self, _: &MouseUpEvent, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.is_selecting = false;
+    }
+
+    /// Scrolls so that the caret, or the selected block, is inside the viewport. It runs
+    /// after a frame was painted, because only then is the position of the selection known.
+    fn scroll_selection_into_view(&mut self, cx: &mut Context<Self>) {
+        self.needs_autoscroll = false;
+        let target = {
+            let layouts = self.layouts.borrow();
+            match &self.selection {
+                Selection::None => None,
+                Selection::Blocks { head, .. } => layouts.get(head).map(|layout| layout.bounds),
+                Selection::Text(selection) => layouts
+                    .get(&selection.block)
+                    .and_then(|layout| layout.caret_bounds(selection.head(), self.caret_upstream)),
+            }
+        };
+        let Some(target) = target else {
+            return;
+        };
+        let viewport = self.scroll_handle.bounds();
+        let top = viewport.top() + SCROLL_MARGIN;
+        let bottom = viewport.bottom() - SCROLL_MARGIN;
+        let mut offset = self.scroll_handle.offset();
+        if target.top() < top || target.size.height > bottom - top {
+            offset.y += top - target.top();
+        } else if target.bottom() > bottom {
+            offset.y -= target.bottom() - bottom;
+        } else {
+            return;
+        }
+        let max_offset = self.scroll_handle.max_offset();
+        offset.y = offset.y.clamp(-max_offset.y, Pixels::ZERO);
+        if offset != self.scroll_handle.offset() {
+            self.scroll_handle.set_offset(offset);
+            cx.notify();
+        }
+    }
+
+    fn key_context(&self) -> KeyContext {
+        let mut context = KeyContext::new_with_defaults();
+        context.add(KEY_CONTEXT);
+        context.set(
+            "mode",
+            match self.mode() {
+                Mode::Idle => "idle",
+                Mode::Navigation => "navigation",
+                Mode::Writing => "writing",
+            },
+        );
+        context
+    }
+
+    fn text_runs(&self, block: &Block, theme: &Theme) -> Vec<TextRun> {
+        let is_heading = matches!(block.kind, BlockKind::Heading(_));
+        let is_done = block.kind == BlockKind::Todo { checked: true };
+        let marked_range = self
+            .text_selection()
+            .filter(|selection| selection.block == block.id)
+            .and(self.marked_range.clone());
+
+        let mut runs = Vec::new();
+        for (range, style) in block.text.styled_ranges() {
+            let monospace = block.kind.is_verbatim() || style.code || style.raw;
+            let font = Font {
+                family: if monospace { MONO_FONT } else { UI_FONT }.into(),
+                features: Default::default(),
+                fallbacks: None,
+                weight: if style.bold || is_heading {
+                    FontWeight::BOLD
+                } else {
+                    FontWeight::NORMAL
+                },
+                style: if style.italic {
+                    FontStyle::Italic
+                } else {
+                    FontStyle::Normal
+                },
+            };
+            let color = if style.link.is_some() {
+                theme.link
+            } else if style.raw || is_done || block.kind == BlockKind::Raw {
+                theme.muted
+            } else {
+                theme.text
+            };
+            let run = TextRun {
+                len: 0,
+                font,
+                color,
+                background_color: (style.code && !block.kind.is_verbatim())
+                    .then_some(theme.code_background),
+                underline: style.link.is_some().then_some(UnderlineStyle {
+                    thickness: px(1.),
+                    color: Some(theme.link),
+                    wavy: false,
+                }),
+                strikethrough: (style.strikethrough || is_done).then_some(StrikethroughStyle {
+                    thickness: px(1.),
+                    color: Some(color),
+                }),
+            };
+
+            // Text being composed by an input method is underlined, which can split a run.
+            let mut pieces = vec![(range.clone(), false)];
+            if let Some(marked) = &marked_range {
+                let start = marked.start.clamp(range.start, range.end);
+                let end = marked.end.clamp(range.start, range.end);
+                pieces = vec![
+                    (range.start..start, false),
+                    (start..end, true),
+                    (end..range.end, false),
+                ];
+            }
+            for (piece, is_marked) in pieces {
+                if piece.is_empty() {
+                    continue;
+                }
+                let mut run = run.clone();
+                run.len = piece.len();
+                if is_marked {
+                    run.underline = Some(UnderlineStyle {
+                        thickness: px(1.),
+                        color: Some(color),
+                        wavy: false,
+                    });
+                }
+                runs.push(run);
+            }
+        }
+        runs
+    }
+
+    fn render_block_text(
+        &self,
+        block: &Block,
+        theme: &Theme,
+        is_focused: bool,
+        cx: &mut Context<Self>,
+    ) -> BlockText {
+        let text = SharedString::from(block.text.text().to_string());
+        let styled_text = StyledText::new(text).with_runs(self.text_runs(block, theme));
+        let mut element = BlockText::new(block.id, styled_text, self.layouts.clone());
+        if let Some(selection) = self.text_selection()
+            && selection.block == block.id
+        {
+            element = element.input(self.focus_handle.clone(), cx.entity());
+            if !selection.range.is_empty() {
+                element = element.selection(selection.range.clone(), theme.text_selection);
+            } else if is_focused && self.caret_visible {
+                element = element.caret(Caret {
+                    offset: selection.head(),
+                    upstream: self.caret_upstream,
+                    color: theme.caret,
+                });
+            }
+        }
+        element
+    }
+
+    fn render_row(
+        &self,
+        row: &Row,
+        highlight: RowHighlight,
+        is_focused: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let block = row.block;
+        let metrics = BlockMetrics::for_kind(&block.kind);
+        let id = block.id;
+        // Rows touch each other, so the bars of consecutive rows read as one line running
+        // down the whole quote.
+        let quote_bar = || {
+            div()
+                .w(INDENT)
+                .flex_none()
+                .flex()
+                .child(div().w(px(3.)).bg(theme.faint))
+        };
+
+        let marker = match &block.kind {
+            BlockKind::Bullet => Some(
+                div()
+                    .w(INDENT)
+                    .flex_none()
+                    .h(metrics.line_height)
+                    .flex()
+                    .items_center()
+                    .child(div().ml(px(5.)).size(px(5.)).rounded_full().bg(theme.muted))
+                    .into_any_element(),
+            ),
+            BlockKind::Numbered => Some(
+                div()
+                    .min_w(INDENT)
+                    .flex_none()
+                    .pr(px(6.))
+                    .text_color(theme.muted)
+                    .child(format!("{}.", row.ordinal))
+                    .into_any_element(),
+            ),
+            BlockKind::Todo { checked } => {
+                let checked = *checked;
+                Some(
+                    div()
+                        .w(INDENT)
+                        .flex_none()
+                        .h(metrics.line_height)
+                        .flex()
+                        .items_center()
+                        .child(
+                            div()
+                                .id(("todo", id as usize))
+                                .size(px(15.))
+                                .rounded(px(3.))
+                                .border_1()
+                                .border_color(if checked { theme.accent } else { theme.muted })
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(11.))
+                                .line_height(px(13.))
+                                .text_color(theme.background)
+                                .when(checked, |checkbox| checkbox.bg(theme.accent).child("✓"))
+                                .cursor_pointer()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.toggle_todo(id, cx);
+                                    }),
+                                ),
+                        )
+                        .into_any_element(),
+                )
+            }
+            _ => None,
+        };
+
+        let content = match &block.kind {
+            BlockKind::Divider => {
+                let layouts = self.layouts.clone();
+                let color = theme.faint;
+                div()
+                    .flex_1()
+                    .h(px(25.))
+                    .child(
+                        canvas(
+                            |_, _, _| {},
+                            move |bounds, _, window, _| {
+                                let line = Bounds::new(
+                                    point(bounds.left(), bounds.center().y),
+                                    gpui::size(bounds.size.width, px(1.)),
+                                );
+                                window.paint_quad(fill(line, color));
+                                layouts
+                                    .borrow_mut()
+                                    .insert(id, BlockLayout::without_text(bounds));
+                            },
+                        )
+                        .size_full(),
+                    )
+                    .into_any_element()
+            }
+            BlockKind::Code { .. } | BlockKind::Raw => {
+                let label = match &block.kind {
+                    BlockKind::Code { language } => language.clone(),
+                    _ => "markdown".to_string(),
+                };
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .px(px(12.))
+                    .py(px(8.))
+                    .rounded(px(6.))
+                    .bg(theme.code_background)
+                    .when(!label.is_empty(), |code| {
+                        code.child(
+                            div()
+                                .text_size(px(11.))
+                                .line_height(px(16.))
+                                .text_color(theme.muted)
+                                .child(label),
+                        )
+                    })
+                    .child(
+                        div()
+                            .cursor_text()
+                            .child(self.render_block_text(block, theme, is_focused, cx)),
+                    )
+                    .into_any_element()
+            }
+            _ => div()
+                .flex_1()
+                .min_w_0()
+                .cursor_text()
+                .child(self.render_block_text(block, theme, is_focused, cx))
+                .into_any_element(),
+        };
+
+        div()
+            .w_full()
+            .flex()
+            .flex_row()
+            .px(px(8.))
+            .when(highlight.selected, |row| row.bg(theme.block_selection))
+            .when(highlight.first, |row| row.rounded_t(px(4.)))
+            .when(highlight.last, |row| row.rounded_b(px(4.)))
+            .children(row.quote_ancestors.iter().map(|is_quote| {
+                if *is_quote {
+                    quote_bar().into_any_element()
+                } else {
+                    div().w(INDENT).flex_none().into_any_element()
+                }
+            }))
+            .when(block.kind == BlockKind::Quote, |row| row.child(quote_bar()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_row()
+                    .pt(metrics.padding_top)
+                    .pb(metrics.padding_bottom)
+                    .text_size(metrics.font_size)
+                    .line_height(metrics.line_height)
+                    .text_color(theme.text)
+                    .children(marker)
+                    .child(content),
+            )
+            .into_any_element()
+    }
+}
+
+/// How a row takes part in the highlight of the selected blocks. The rows of a selection
+/// form one shape, so only its first and last rows have rounded corners.
+#[derive(Clone, Copy, Default)]
+struct RowHighlight {
+    selected: bool,
+    first: bool,
+    last: bool,
+}
+
+/// Font size and spacing of a block type.
+struct BlockMetrics {
+    font_size: Pixels,
+    line_height: Pixels,
+    padding_top: Pixels,
+    padding_bottom: Pixels,
+}
+
+impl BlockMetrics {
+    fn for_kind(kind: &BlockKind) -> Self {
+        let (font_size, line_height, padding_top, padding_bottom) = match kind {
+            BlockKind::Heading(1) => (28., 36., 20., 4.),
+            BlockKind::Heading(2) => (22., 30., 16., 4.),
+            BlockKind::Heading(3) => (18., 26., 12., 3.),
+            BlockKind::Heading(_) => (15., 24., 10., 3.),
+            BlockKind::Code { .. } | BlockKind::Raw => (13., 20., 4., 4.),
+            BlockKind::Divider => (15., 24., 0., 0.),
+            BlockKind::Bullet | BlockKind::Numbered | BlockKind::Todo { .. } => (15., 24., 1., 1.),
+            _ => (15., 24., 4., 4.),
+        };
+        Self {
+            font_size: px(font_size),
+            line_height: px(line_height),
+            padding_top: px(padding_top),
+            padding_bottom: px(padding_bottom),
+        }
+    }
+}
+
+impl Render for Editor {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::for_appearance(window.appearance());
+        let is_focused = self.focus_handle.is_focused(window);
+        if self.needs_autoscroll {
+            cx.on_next_frame(window, |this, _, cx| this.scroll_selection_into_view(cx));
+        }
+        let rows = self.document.rows();
+        let selected_blocks = match &self.selection {
+            Selection::Blocks { anchor, head } => self.document.subtree_ids(*anchor, *head),
+            _ => HashSet::new(),
+        };
+        {
+            let row_ids: HashSet<BlockId> = rows.iter().map(|row| row.block.id).collect();
+            self.layouts
+                .borrow_mut()
+                .retain(|id, _| row_ids.contains(id));
+        }
+
+        let is_selected = |index: usize| {
+            rows.get(index)
+                .is_some_and(|row| selected_blocks.contains(&row.block.id))
+        };
+        let mut elements = Vec::with_capacity(rows.len());
+        for (index, row) in rows.iter().enumerate() {
+            let selected = is_selected(index);
+            let highlight = RowHighlight {
+                selected,
+                first: selected && !index.checked_sub(1).is_some_and(is_selected),
+                last: selected && !is_selected(index + 1),
+            };
+            elements.push(self.render_row(row, highlight, is_focused, &theme, cx));
+        }
+
+        let mode = match self.mode() {
+            Mode::Idle => "",
+            Mode::Navigation => "NAVIGATION",
+            Mode::Writing => "WRITING",
+        };
+
+        div()
+            .id("editor")
+            .key_context(self.key_context())
+            .track_focus(&self.focus_handle)
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(theme.background)
+            .on_action(cx.listener(Self::move_up))
+            .on_action(cx.listener(Self::move_down))
+            .on_action(cx.listener(Self::move_left))
+            .on_action(cx.listener(Self::move_right))
+            .on_action(cx.listener(Self::select_up))
+            .on_action(cx.listener(Self::select_down))
+            .on_action(cx.listener(Self::select_left))
+            .on_action(cx.listener(Self::select_right))
+            .on_action(cx.listener(Self::move_word_left))
+            .on_action(cx.listener(Self::move_word_right))
+            .on_action(cx.listener(Self::select_word_left))
+            .on_action(cx.listener(Self::select_word_right))
+            .on_action(cx.listener(Self::move_to_line_start))
+            .on_action(cx.listener(Self::move_to_line_end))
+            .on_action(cx.listener(Self::select_to_line_start))
+            .on_action(cx.listener(Self::select_to_line_end))
+            .on_action(cx.listener(Self::enter))
+            .on_action(cx.listener(Self::line_break))
+            .on_action(cx.listener(Self::new_block_below))
+            .on_action(cx.listener(Self::open_below))
+            .on_action(cx.listener(Self::open_above))
+            .on_action(cx.listener(Self::escape))
+            .on_action(cx.listener(Self::backspace))
+            .on_action(cx.listener(Self::delete))
+            .on_action(cx.listener(Self::delete_word_backward))
+            .on_action(cx.listener(Self::delete_to_line_start))
+            .on_action(cx.listener(Self::indent))
+            .on_action(cx.listener(Self::outdent))
+            .on_action(cx.listener(Self::move_blocks_up))
+            .on_action(cx.listener(Self::move_blocks_down))
+            .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(Self::copy))
+            .on_action(cx.listener(Self::cut))
+            .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::undo))
+            .on_action(cx.listener(Self::redo))
+            .on_action(cx.listener(Self::toggle_bold))
+            .on_action(cx.listener(Self::toggle_italic))
+            .on_action(cx.listener(Self::toggle_code))
+            .on_action(cx.listener(Self::toggle_strikethrough))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
+            .on_mouse_move(cx.listener(Self::mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
+            .child(
+                div()
+                    .id("document")
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll_handle)
+                    .child(
+                        div()
+                            .mx_auto()
+                            .w_full()
+                            .max_w(CONTENT_WIDTH)
+                            .px(px(24.))
+                            .pt(px(32.))
+                            .pb(px(160.))
+                            .flex()
+                            .flex_col()
+                            .children(elements),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .h(px(24.))
+                    .px(px(12.))
+                    .flex()
+                    .items_center()
+                    .text_size(px(11.))
+                    .text_color(theme.muted)
+                    .child(mode),
+            )
+    }
+}
+
+impl EntityInputHandler for Editor {
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let text = self.active_text()?.text();
+        let range = range_from_utf16(text, &range_utf16);
+        adjusted_range.replace(range_to_utf16(text, &range));
+        Some(text[range].to_string())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let selection = self.text_selection()?;
+        let text = self.active_text()?.text();
+        Some(UTF16Selection {
+            range: range_to_utf16(text, &selection.range),
+            reversed: selection.reversed,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        let text = self.active_text()?.text();
+        self.marked_range
+            .as_ref()
+            .map(|range| range_to_utf16(text, range))
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.marked_range = None;
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(selection) = self.text_selection().cloned() else {
+            return;
+        };
+        let Some(text) = self.active_text().map(|text| text.text()) else {
+            return;
+        };
+        let range = range_utf16
+            .map(|range_utf16| range_from_utf16(text, &range_utf16))
+            .or(self.marked_range.clone())
+            .unwrap_or(selection.range);
+        self.marked_range = None;
+        self.insert_text(range, new_text, cx);
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range_utf16: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(selection) = self.text_selection().cloned() else {
+            return;
+        };
+        let Some(text) = self.active_text().map(|text| text.text()) else {
+            return;
+        };
+        let range = range_utf16
+            .map(|range_utf16| range_from_utf16(text, &range_utf16))
+            .or(self.marked_range.clone())
+            .unwrap_or(selection.range);
+        self.insert_text(range.clone(), new_text, cx);
+
+        self.marked_range =
+            (!new_text.is_empty()).then(|| range.start..range.start + new_text.len());
+        if let Some(selected_utf16) = new_selected_range_utf16 {
+            let selected = range_from_utf16(new_text, &selected_utf16);
+            self.selection = Selection::Text(TextSelection {
+                block: selection.block,
+                range: range.start + selected.start..range.start + selected.end,
+                reversed: false,
+            });
+        }
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        _element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let selection = self.text_selection()?;
+        let range = range_from_utf16(self.active_text()?.text(), &range_utf16);
+        let layouts = self.layouts.borrow();
+        let layout = layouts.get(&selection.block)?;
+        layout
+            .range_bounds(range.clone())
+            .into_iter()
+            .next()
+            .or_else(|| layout.caret_bounds(range.start, false))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let selection = self.text_selection()?;
+        let text = self.active_text()?.text();
+        let layouts = self.layouts.borrow();
+        let (offset, _) = layouts.get(&selection.block)?.offset_for_point(point);
+        Some(offset_to_utf16(text, offset))
+    }
+}
+
+/// The block type that typing `marker` followed by a space at the start of a block of type
+/// `current` turns it into.
+fn shortcut_kind(marker: &str, current: &BlockKind) -> Option<BlockKind> {
+    let task = match marker {
+        "[]" | "[ ]" => Some(BlockKind::Todo { checked: false }),
+        "[x]" | "[X]" => Some(BlockKind::Todo { checked: true }),
+        _ => None,
+    };
+    match current {
+        BlockKind::Paragraph => {}
+        // Typing a Markdown task item goes through a bullet first: `- ` then `[ ] `.
+        BlockKind::Bullet => return task,
+        _ => return None,
+    }
+    if task.is_some() {
+        return task;
+    }
+    match marker {
+        "-" | "*" | "+" => return Some(BlockKind::Bullet),
+        ">" => return Some(BlockKind::Quote),
+        "```" => {
+            return Some(BlockKind::Code {
+                language: String::new(),
+            });
+        }
+        "---" => return Some(BlockKind::Divider),
+        _ => {}
+    }
+    if (1..=6).contains(&marker.len()) && marker.chars().all(|character| character == '#') {
+        return Some(BlockKind::Heading(marker.len() as u8));
+    }
+    let digits = marker.trim_end_matches(['.', ')']);
+    let is_ordinal = digits.len() + 1 == marker.len()
+        && !digits.is_empty()
+        && digits.len() <= 9
+        && digits.chars().all(|character| character.is_ascii_digit());
+    is_ordinal.then_some(BlockKind::Numbered)
+}
+
+/// The link target when the pasted text is nothing but a URL.
+fn pasted_url(text: &str) -> Option<Arc<str>> {
+    let text = text.trim();
+    if text.is_empty() || text.contains(char::is_whitespace) {
+        return None;
+    }
+    let url = url::Url::parse(text).ok()?;
+    let is_link = match url.scheme() {
+        "http" | "https" | "ftp" => url.has_host(),
+        "mailto" => true,
+        _ => false,
+    };
+    is_link.then(|| text.into())
+}
+
+fn previous_grapheme(text: &str, offset: usize) -> usize {
+    text.grapheme_indices(true)
+        .rev()
+        .find_map(|(index, _)| (index < offset).then_some(index))
+        .unwrap_or(0)
+}
+
+fn next_grapheme(text: &str, offset: usize) -> usize {
+    text.grapheme_indices(true)
+        .find_map(|(index, _)| (index > offset).then_some(index))
+        .unwrap_or(text.len())
+}
+
+fn previous_word_start(text: &str, offset: usize) -> usize {
+    text.split_word_bound_indices()
+        .take_while(|(index, _)| *index < offset)
+        .filter(|(_, word)| !word.trim().is_empty())
+        .last()
+        .map_or(0, |(index, _)| index)
+}
+
+fn next_word_end(text: &str, offset: usize) -> usize {
+    text.split_word_bound_indices()
+        .map(|(index, word)| (index + word.len(), word))
+        .find(|(end, word)| *end > offset && !word.trim().is_empty())
+        .map_or(text.len(), |(end, _)| end)
+}
+
+/// The word at `offset`, or the whitespace or punctuation there when it is not in a word.
+fn word_range(text: &str, offset: usize) -> Range<usize> {
+    text.split_word_bound_indices()
+        .map(|(index, word)| index..index + word.len())
+        .find(|range| range.contains(&offset) || range.end == text.len())
+        .unwrap_or(offset..offset)
+}
+
+fn offset_from_utf16(text: &str, offset_utf16: usize) -> usize {
+    let mut utf16_count = 0;
+    for (index, character) in text.char_indices() {
+        if utf16_count >= offset_utf16 {
+            return index;
+        }
+        utf16_count += character.len_utf16();
+    }
+    text.len()
+}
+
+fn offset_to_utf16(text: &str, offset: usize) -> usize {
+    text.char_indices()
+        .take_while(|(index, _)| *index < offset)
+        .map(|(_, character)| character.len_utf16())
+        .sum()
+}
+
+fn range_from_utf16(text: &str, range_utf16: &Range<usize>) -> Range<usize> {
+    offset_from_utf16(text, range_utf16.start)..offset_from_utf16(text, range_utf16.end)
+}
+
+fn range_to_utf16(text: &str, range: &Range<usize>) -> Range<usize> {
+    offset_to_utf16(text, range.start)..offset_to_utf16(text, range.end)
+}

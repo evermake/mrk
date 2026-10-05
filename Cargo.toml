@@ -1,0 +1,33 @@
+[package]
+name = "mrk"
+version = "0.1.0"
+edition = "2024"
+description = "GPUI-based rich-text editor with Notion-like block structure"
+publish = false
+
+[lib]
+path = "src/mrk.rs"
+
+[[bin]]
+name = "mrk"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+gpui = { git = "https://github.com/zed-industries/zed", rev = "70db535ccf6eee2c3e948b0e842f6c46a39dd382" }
+# `runtime_shaders` compiles the Metal shaders at startup, so building does not need
+# Xcode's optional Metal Toolchain component.
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "70db535ccf6eee2c3e948b0e842f6c46a39dd382", features = ["font-kit", "runtime_shaders"] }
+pulldown-cmark = { version = "0.13", default-features = false }
+unicode-segmentation = "1.10"
+url = "2"
+
+[dev-dependencies]
+gpui = { git = "https://github.com/zed-industries/zed", rev = "70db535ccf6eee2c3e948b0e842f6c46a39dd382", features = ["test-support"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "70db535ccf6eee2c3e948b0e842f6c46a39dd382", features = ["test-support"] }
+pretty_assertions = "1"
+
+# GPUI's executor is built against this async-task revision; `[patch]` sections
+# of a git dependency's workspace are not inherited, so it is repeated here.
+[patch.crates-io]
+async-task = { git = "https://github.com/smol-rs/async-task.git", rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e" }

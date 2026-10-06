@@ -166,6 +166,8 @@ const INDENT: Rems = zoomed(24.);
 const CONTENT_WIDTH: Rems = zoomed(760.);
 const SCROLL_MARGIN: Pixels = px(24.);
 const CODE_INDENT: &str = "    ";
+/// What turns a paragraph into a divider as soon as it is typed at its start.
+const DIVIDER_SHORTCUT: &str = "---";
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
 /// Consecutive typing within this interval is undone as one step.
 const UNDO_GROUP_INTERVAL: Duration = Duration::from_secs(1);
@@ -1102,7 +1104,12 @@ impl Editor {
             return;
         }
         if kind == BlockKind::Paragraph && matches!(text.as_str(), "---" | "***" | "___") {
-            self.transact(EditKind::Other, cx, |this| this.convert_to_divider(id));
+            self.transact(EditKind::Other, cx, |this| {
+                if let Some(block) = this.document.block_mut(id) {
+                    block.text = RichText::new();
+                }
+                this.convert_to_divider(id)
+            });
             return;
         }
         if text.is_empty() && kind != BlockKind::Paragraph {
@@ -1131,12 +1138,20 @@ impl Editor {
         });
     }
 
-    /// Turns `block` into a divider and continues writing in a new paragraph below it.
+    /// Turns `block` into a divider and continues writing in a new paragraph below it, which
+    /// takes over the text of the block.
     fn convert_to_divider(&mut self, block: BlockId) -> bool {
+        let Some(text) = self
+            .document
+            .block_mut(block)
+            .map(|block| std::mem::take(&mut block.text))
+        else {
+            return false;
+        };
         if !self.document.set_kind(block, BlockKind::Divider) {
             return false;
         }
-        let paragraph = Block::paragraph(RichText::new());
+        let paragraph = Block::paragraph(text);
         match self.document.insert_after(block, vec![paragraph]).first() {
             Some(&paragraph) => {
                 self.selection = Selection::Text(TextSelection::caret(paragraph, 0));
@@ -1464,13 +1479,15 @@ impl Editor {
             this.selection = Selection::Text(TextSelection::caret(id, caret));
             true
         });
-        if changed && text == " " {
+        // A space ends a marker, and a dash may be the last one of a divider.
+        if changed && matches!(text, " " | "-") {
             self.apply_typing_shortcut(id, cx);
         }
     }
 
     /// Converts the block when the text typed at its start is a Markdown block marker, e.g.
-    /// `# ` for a heading. It is its own undo step, so undoing brings the typed marker back.
+    /// `# ` for a heading, or the dashes of a divider, which need no space after them. It is
+    /// its own undo step, so undoing brings the typed marker back.
     fn apply_typing_shortcut(&mut self, id: BlockId, cx: &mut Context<Self>) {
         let Some(selection) = self.text_selection().cloned() else {
             return;
@@ -1479,10 +1496,15 @@ impl Editor {
             return;
         };
         let caret = selection.head();
-        let Some(marker) = block.text.text()[..caret].strip_suffix(' ') else {
-            return;
+        let typed = &block.text.text()[..caret];
+        let kind = if typed == DIVIDER_SHORTCUT && block.kind == BlockKind::Paragraph {
+            Some(BlockKind::Divider)
+        } else {
+            typed
+                .strip_suffix(' ')
+                .and_then(|marker| shortcut_kind(marker, &block.kind))
         };
-        let Some(kind) = shortcut_kind(marker, &block.kind) else {
+        let Some(kind) = kind else {
             return;
         };
         self.transact(EditKind::Other, cx, |this| {
@@ -2640,7 +2662,6 @@ fn shortcut_kind(marker: &str, current: &BlockKind) -> Option<BlockKind> {
                 language: String::new(),
             });
         }
-        "---" => return Some(BlockKind::Divider),
         _ => {}
     }
     if (1..=6).contains(&marker.len()) && marker.chars().all(|character| character == '#') {

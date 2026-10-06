@@ -1,9 +1,9 @@
 //! Regression tests for the Markdown typing shortcuts: a marker typed at the start of a
-//! paragraph and followed by a space converts the block, and a code fence or a rule converts
-//! it on Enter.
+//! paragraph and followed by a space converts the block, three dashes convert it as the last
+//! of them is typed, and a code fence or a rule converts it on Enter.
 //!
-//! [`MARKERS`], [`FENCES`] and [`RULES`] list every shortcut the editor promises. A new
-//! shortcut gets a row there, and the tests below then cover it.
+//! [`MARKERS`], [`DASHES`], [`FENCES`] and [`RULES`] list every shortcut the editor promises.
+//! A new shortcut gets a row there, and the tests below then cover it.
 
 use gpui::{Entity, TestAppContext, VisualTestContext};
 use pretty_assertions::assert_eq;
@@ -31,13 +31,16 @@ const MARKERS: &[(&str, &str)] = &[
     ("[X]", "[x] ˇ\n"),
     (">", "> ˇ\n"),
     ("```", "code() ˇ\n"),
-    ("---", "---\np ˇ\n"),
 ];
+
+/// What converts a paragraph into a divider as soon as it is typed, with no space after it.
+const DASHES: &str = "---";
 
 /// What converts a paragraph into a code block on Enter, with the block's language.
 const FENCES: &[(&str, &str)] = &[("```", ""), ("```rust", "rust"), ("```c++", "c++")];
 
-/// What converts a paragraph into a divider on Enter.
+/// What converts a paragraph into a divider on Enter. The dashes get there only as text
+/// that undoing their own conversion brought back.
 const RULES: &[&str] = &["---", "***", "___"];
 
 /// A new note with the caret in its only, empty paragraph.
@@ -99,12 +102,21 @@ fn backspace_turns_a_converted_block_back_into_a_paragraph(cx: &mut TestAppConte
 }
 
 #[gpui::test]
+fn backspace_after_dashes_goes_back_above_the_divider(cx: &mut TestAppContext) {
+    let (editor, mut cx) = empty_note(cx);
+    type_text("above\n", &mut cx);
+    type_text(DASHES, &mut cx);
+    assert_eq!(state(&editor, &mut cx), "p above\n---\np ˇ\n");
+    cx.simulate_keystrokes("backspace");
+    assert_eq!(state(&editor, &mut cx), "p aboveˇ\n---\n");
+}
+
+#[gpui::test]
 fn text_that_only_resembles_a_marker_stays_text(cx: &mut TestAppContext) {
     for text in [
         "#######",
         "#a",
         "--",
-        "----",
         "1",
         ".",
         "a.",
@@ -179,6 +191,11 @@ fn markers_are_text_in_blocks_that_are_not_paragraphs(cx: &mut TestAppContext) {
         ("```\ncode\n```\n", "# ", "code() # ˇcode\n"),
         ("```\ncode\n```\n", "- ", "code() - ˇcode\n"),
         ("```\ncode\n```\n", "[] ", "code() [] ˇcode\n"),
+        ("# Title\n", DASHES, "h1 ---ˇTitle\n"),
+        ("- item\n", DASHES, "- ---ˇitem\n"),
+        ("- [ ] task\n", DASHES, "[ ] ---ˇtask\n"),
+        ("> quote\n", DASHES, "> ---ˇquote\n"),
+        ("```\ncode\n```\n", DASHES, "code() ---ˇcode\n"),
     ] {
         let (editor, mut cx) = writing_at_start(source, cx);
         type_text(typed, &mut cx);
@@ -188,6 +205,68 @@ fn markers_are_text_in_blocks_that_are_not_paragraphs(cx: &mut TestAppContext) {
             "typing {typed:?} into {source:?}"
         );
     }
+}
+
+#[gpui::test]
+fn dashes_convert_a_paragraph_as_the_third_is_typed(cx: &mut TestAppContext) {
+    let (editor, mut cx) = empty_note(cx);
+    type_text(&DASHES[1..], &mut cx);
+    assert_eq!(state(&editor, &mut cx), "p --ˇ\n");
+    type_text(&DASHES[..1], &mut cx);
+    assert_eq!(state(&editor, &mut cx), "---\np ˇ\n");
+    assert_eq!(mode(&editor, &mut cx), Mode::Writing);
+
+    // A fourth dash is the first thing written below the divider.
+    type_text("-", &mut cx);
+    assert_eq!(state(&editor, &mut cx), "---\np -ˇ\n");
+}
+
+#[gpui::test]
+fn undoing_the_conversion_of_dashes_leaves_them_as_text(cx: &mut TestAppContext) {
+    // Undone, the dashes are text to carry on from: neither a space nor a dash converts them.
+    for (typed, expected) in [("", "p ---ˇ\n"), (" x", "p --- xˇ\n"), ("-", "p ----ˇ\n")] {
+        let (editor, mut cx) = empty_note(cx);
+        type_text(DASHES, &mut cx);
+        cx.simulate_keystrokes("cmd-z");
+        type_text(typed, &mut cx);
+        assert_eq!(state(&editor, &mut cx), expected, "typing {typed:?}");
+    }
+
+    let (editor, mut cx) = empty_note(cx);
+    type_text(DASHES, &mut cx);
+    cx.simulate_keystrokes("cmd-z cmd-shift-z");
+    assert_eq!(state(&editor, &mut cx), "---\np ˇ\n");
+}
+
+#[gpui::test]
+fn dashes_typed_before_existing_text_put_a_divider_above_it(cx: &mut TestAppContext) {
+    let (editor, mut cx) = writing_at_start("hello **world**\n", cx);
+    type_text(DASHES, &mut cx);
+    assert_eq!(state(&editor, &mut cx), "---\np ˇhello <b>world</b>\n");
+    assert_eq!(saved(&editor, &mut cx), "---\n\nhello **world**\n");
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(state(&editor, &mut cx), "p ---ˇhello <b>world</b>\n");
+}
+
+#[gpui::test]
+fn dashes_convert_only_at_the_start_of_the_block(cx: &mut TestAppContext) {
+    let (editor, mut cx) = empty_note(cx);
+    type_text("a---", &mut cx);
+    assert_eq!(state(&editor, &mut cx), "p a---ˇ\n");
+
+    // The start of a later line of the same block does not count.
+    cx.simulate_keystrokes("shift-enter");
+    type_text(DASHES, &mut cx);
+    assert_eq!(state(&editor, &mut cx), "p a---⏎---ˇ\n");
+}
+
+#[gpui::test]
+fn dashes_convert_only_with_the_caret_right_after_them(cx: &mut TestAppContext) {
+    let (editor, mut cx) = empty_note(cx);
+    type_text("--", &mut cx);
+    cx.simulate_keystrokes("left");
+    type_text("-", &mut cx);
+    assert_eq!(state(&editor, &mut cx), "p --ˇ-\n");
 }
 
 #[gpui::test]
@@ -238,6 +317,14 @@ fn a_rule_converts_on_enter(cx: &mut TestAppContext) {
     for &rule in RULES {
         let (editor, mut cx) = empty_note(cx);
         type_text(rule, &mut cx);
+        if rule == DASHES {
+            cx.simulate_keystrokes("cmd-z");
+        }
+        assert_eq!(
+            state(&editor, &mut cx),
+            format!("p {rule}ˇ\n"),
+            "{rule:?} before Enter"
+        );
         cx.simulate_keystrokes("enter");
         assert_eq!(state(&editor, &mut cx), "---\np ˇ\n", "after {rule:?}");
         cx.simulate_keystrokes("cmd-z");
@@ -253,7 +340,7 @@ fn a_rule_converts_on_enter(cx: &mut TestAppContext) {
 fn enter_splits_what_is_not_quite_a_fence_or_a_rule(cx: &mut TestAppContext) {
     for (typed, expected) in [
         ("--\nx", "p --\np xˇ\n"),
-        ("----\nx", "p ----\np xˇ\n"),
+        ("****\nx", "p ****\np xˇ\n"),
         ("```a`b\nx", "p ```a`b\np xˇ\n"),
         // Fences and rules convert paragraphs only.
         ("- ---\nx", "- ---\n- xˇ\n"),
@@ -337,7 +424,8 @@ fn typing_markdown_writes_that_markdown(cx: &mut TestAppContext) {
         ("- [ ] task", "- [ ] task\n"),
         ("> quote", "> quote\n"),
         ("```sh\nls -la", "```sh\nls -la\n```\n"),
-        ("above\n---\nbelow", "above\n\n---\n\nbelow\n"),
+        ("above\n---below", "above\n\n---\n\nbelow\n"),
+        ("above\n***\nbelow", "above\n\n---\n\nbelow\n"),
     ] {
         let (editor, mut cx) = empty_note(cx);
         type_text(typed, &mut cx);
@@ -355,7 +443,7 @@ fn a_whole_note_can_be_typed_as_markdown(cx: &mut TestAppContext) {
     type_text("> quote\n", &mut cx);
     type_text("```sh\necho hi", &mut cx);
     cx.simulate_keystrokes("cmd-enter");
-    type_text("---\ndone", &mut cx);
+    type_text("---done", &mut cx);
 
     assert_eq!(
         state(&editor, &mut cx),
@@ -427,7 +515,8 @@ fn shortcut_kinds() {
     }
     assert_eq!(shortcut_kind(">", &paragraph), Some(BlockKind::Quote));
     assert_eq!(shortcut_kind("```", &paragraph), Some(code.clone()));
-    assert_eq!(shortcut_kind("---", &paragraph), Some(BlockKind::Divider));
+    // Dashes convert before a space can follow them.
+    assert_eq!(shortcut_kind(DASHES, &paragraph), None);
 
     // A to-do can be started in a paragraph or, as Markdown spells it, in a bullet.
     for current in [&paragraph, &BlockKind::Bullet] {

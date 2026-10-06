@@ -122,16 +122,20 @@ Typing a marker at the start of a paragraph, followed by a space, converts the b
 | `[]`, `[ ]`, `[x]` (also inside a bullet) | to-do |
 | `>` | quote |
 | ` ``` ` | code block |
-| `---` | divider |
 
-` ```rust ` followed by `Enter` makes a code block with a language, and `---` followed by
-`Enter` a divider.
+`---` needs no space: the paragraph becomes a divider as the third dash is typed, and any
+text after the dashes carries on below the divider. Undoing brings the dashes back as text.
+
+` ```rust ` followed by `Enter` makes a code block with a language, and a paragraph that is
+just `***`, `___` or `---` becomes a divider on `Enter`.
 
 - `Enter` splits the block; on an empty list item it ends the list.
 - `Shift+Enter` breaks the line inside the block; `Cmd+Enter` starts a new paragraph below
   (the way out of a code block, where `Enter` is a line break).
 - `Backspace` at the start of a block turns it into a paragraph, then joins it with the block
-  above.
+  above. Below a divider, an empty paragraph goes away and writing continues at the end of
+  the text above the divider, which stays. A paragraph with text removes the divider
+  instead, and so does an empty one with no text above the divider to go to.
 - `Tab` / `Shift+Tab` and `Alt+Up` / `Alt+Down` act on the block being written in.
 - `Cmd+E` toggles inline code and `Cmd+Shift+X` strikethrough.
 - `Cmd`-click opens a link.
@@ -189,8 +193,8 @@ shows while scrolling and while the pointer is at the right edge, and when a not
 
 The editor's tests press real keys and compare the resulting document (`src/editor/tests.rs`).
 The typing shortcuts have their own suite, `src/editor/tests/typing_shortcuts.rs`: its
-`MARKERS`, `FENCES` and `RULES` tables list every shortcut, so a new shortcut starts as a new
-row there, and a new key binding as a test that fails without it.
+`MARKERS`, `DASHES`, `FENCES` and `RULES` tables list every shortcut, so a new shortcut
+starts as a new row there, and a new key binding as a test that fails without it.
 
 `cargo run --example screenshot -- note.md out.png "down down enter"` renders a file to a PNG
 without opening a window, optionally after replaying keystrokes.

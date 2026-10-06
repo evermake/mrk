@@ -753,6 +753,17 @@ impl Document {
         let previous = self.block(previous_id)?;
         let block = self.block(id)?;
         if !previous.kind.has_text() {
+            // An empty block gives way itself, and the caret moves over the divider to the
+            // text above it. A block with text stays, and so does one with no text above
+            // the divider to move to: there it is the divider that goes.
+            if block.text.is_empty()
+                && block.children.is_empty()
+                && let Some(above) = self.previous_text_block(previous_id)
+            {
+                let offset = self.block(above)?.text.len();
+                self.remove(id);
+                return Some((above, offset));
+            }
             self.remove(previous_id);
             return Some((id, 0));
         }
@@ -768,6 +779,17 @@ impl Document {
         let removed = self.take_promoting_children(id)?;
         self.block_mut(previous_id)?.text.append(removed.text);
         Some((previous_id, offset))
+    }
+
+    /// The nearest block displayed above `id` that has text.
+    fn previous_text_block(&self, id: BlockId) -> Option<BlockId> {
+        let mut current = id;
+        loop {
+            current = self.previous(current)?;
+            if self.block(current)?.kind.has_text() {
+                return Some(current);
+            }
+        }
     }
 
     /// Joins the text of the block below `id` onto its end, as Delete at the end of a block
@@ -1273,6 +1295,36 @@ mod tests {
         let below = document.find("below");
         assert_eq!(document.merge_into_previous(below), Some((below, 0)));
         assert_eq!(document.outline(), "p above\np below\n");
+    }
+
+    #[test]
+    fn merge_into_previous_removes_an_empty_block_below_a_divider() {
+        let mut document = document("above\n\n---\n\n---\n\nbelow\n");
+        let above = document.first();
+        let below = document.find("below");
+        document.block_mut(below).unwrap().text = RichText::new();
+        assert_eq!(document.merge_into_previous(below), Some((above, 5)));
+        assert_eq!(document.outline(), "p above\n---\n---\n");
+    }
+
+    #[test]
+    fn merge_into_previous_removes_a_divider_with_no_text_above_it() {
+        let mut document = document("---\n\nbelow\n");
+        let below = document.find("below");
+        document.block_mut(below).unwrap().text = RichText::new();
+        assert_eq!(document.merge_into_previous(below), Some((below, 0)));
+        assert_eq!(document.outline(), "p \n");
+    }
+
+    #[test]
+    fn merge_into_previous_finds_the_text_above_a_nested_divider() {
+        let mut document = document("- item\n\n  ---\n\n  below\n");
+        let item = document.find("item");
+        let below = document.find("below");
+        assert_eq!(document.outline(), "- item\n  ---\n  p below\n");
+        document.block_mut(below).unwrap().text = RichText::new();
+        assert_eq!(document.merge_into_previous(below), Some((item, 4)));
+        assert_eq!(document.outline(), "- item\n  ---\n");
     }
 
     #[test]

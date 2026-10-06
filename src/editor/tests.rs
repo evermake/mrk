@@ -228,6 +228,106 @@ fn d_deletes_the_selected_blocks(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn space_toggles_the_selected_to_do(cx: &mut TestAppContext) {
+    let (editor, mut cx) = open("- [ ] task\n", cx);
+    // Nothing is selected yet, so there is nothing to toggle.
+    cx.simulate_keystrokes("space");
+    assert_eq!(state(&editor, &mut cx), "[ ] task\n");
+    assert!(!editor.read_with(&cx, |editor, _| editor.is_dirty()));
+
+    cx.simulate_keystrokes("down space");
+    assert_eq!(state(&editor, &mut cx), "* [x] task\n");
+    cx.simulate_keystrokes("space");
+    assert_eq!(state(&editor, &mut cx), "* [ ] task\n");
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(state(&editor, &mut cx), "* [x] task\n");
+
+    // In writing mode it is a character like any other.
+    cx.simulate_keystrokes("enter space");
+    assert_eq!(state(&editor, &mut cx), "[x] task ˇ\n");
+}
+
+#[gpui::test]
+fn space_checks_the_selected_to_dos_unless_all_are_checked(cx: &mut TestAppContext) {
+    for (source, keys, expected) in [
+        (
+            "- [ ] a\n- [ ] b\n- [ ] c\n",
+            "down shift-down space",
+            "* [x] a\n* [x] b\n  [ ] c\n",
+        ),
+        // The ones that are done already stay done, whichever end the selection started from.
+        (
+            "- [x] a\n- [ ] b\n- [x] c\n",
+            "down shift-down shift-down space",
+            "* [x] a\n* [x] b\n* [x] c\n",
+        ),
+        (
+            "- [ ] a\n- [x] b\n- [x] c\n",
+            "up shift-up shift-up space",
+            "* [x] a\n* [x] b\n* [x] c\n",
+        ),
+        (
+            "- [x] a\n- [x] b\n- [ ] c\n",
+            "down shift-down space",
+            "* [ ] a\n* [ ] b\n  [ ] c\n",
+        ),
+        (
+            "- [x] a\n- [ ] b\n- [x] c\n",
+            "down shift-down shift-down space space",
+            "* [ ] a\n* [ ] b\n* [ ] c\n",
+        ),
+    ] {
+        let (editor, mut cx) = open(source, cx);
+        cx.simulate_keystrokes(keys);
+        assert_eq!(state(&editor, &mut cx), expected, "after {keys:?}");
+    }
+
+    // Together they are one step to undo.
+    let (editor, mut cx) = open("- [x] a\n- [ ] b\n", cx);
+    cx.simulate_keystrokes("down shift-down space cmd-z");
+    assert_eq!(state(&editor, &mut cx), "* [x] a\n* [ ] b\n");
+}
+
+#[gpui::test]
+fn space_leaves_the_to_dos_nested_in_the_selected_ones_alone(cx: &mut TestAppContext) {
+    let (editor, mut cx) = open("- [ ] parent\n  - [x] done\n  - [ ] open\n- [ ] next\n", cx);
+    cx.simulate_keystrokes("down space");
+    assert_eq!(
+        state(&editor, &mut cx),
+        "* [x] parent\n*   [x] done\n*   [ ] open\n  [ ] next\n"
+    );
+    // `open` is not one of the selected to-dos, so all of them are checked.
+    cx.simulate_keystrokes("space");
+    assert_eq!(
+        state(&editor, &mut cx),
+        "* [ ] parent\n*   [x] done\n*   [ ] open\n  [ ] next\n"
+    );
+    cx.simulate_keystrokes("right shift-down space");
+    assert_eq!(
+        state(&editor, &mut cx),
+        "  [ ] parent\n*   [x] done\n*   [x] open\n  [ ] next\n"
+    );
+}
+
+#[gpui::test]
+fn space_skips_the_selected_blocks_that_are_not_to_dos(cx: &mut TestAppContext) {
+    let (editor, mut cx) = open("- [x] a\n- b\n  - [ ] b1\n- [ ] c\n\ntext\n", cx);
+    cx.simulate_keystrokes("cmd-a space");
+    assert_eq!(
+        state(&editor, &mut cx),
+        "* [x] a\n* - b\n*   [ ] b1\n* [x] c\n* p text\n"
+    );
+
+    // With no to-do among them nothing happens.
+    cx.simulate_keystrokes("cmd-z escape down down space");
+    assert_eq!(
+        state(&editor, &mut cx),
+        "  [x] a\n* - b\n*   [ ] b1\n  [ ] c\n  p text\n"
+    );
+    assert!(!editor.read_with(&cx, |editor, _| editor.is_dirty()));
+}
+
+#[gpui::test]
 fn o_opens_a_block_below_and_shift_o_above(cx: &mut TestAppContext) {
     for (keys, expected) in [
         // `a`, with everything nested in it.

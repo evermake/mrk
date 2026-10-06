@@ -74,6 +74,7 @@ pub mod actions {
             ToggleItalic,
             ToggleCode,
             ToggleStrikethrough,
+            ToggleTodos,
         ]
     );
 }
@@ -84,7 +85,7 @@ use actions::{
     MoveToLineStart, MoveUp, MoveWordLeft, MoveWordRight, NewBlockBelow, OpenAbove, OpenBelow,
     Outdent, Paste, Redo, SelectAll, SelectDown, SelectLeft, SelectRight, SelectToLineEnd,
     SelectToLineStart, SelectUp, SelectWordLeft, SelectWordRight, ToggleBold, ToggleCode,
-    ToggleItalic, ToggleStrikethrough, Undo, WriteAtEnd, WriteAtStart,
+    ToggleItalic, ToggleStrikethrough, ToggleTodos, Undo, WriteAtEnd, WriteAtStart,
 };
 
 const KEY_CONTEXT: &str = "Editor";
@@ -122,6 +123,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-i", WriteAtStart, not_writing),
         KeyBinding::new("a", WriteAtEnd, not_writing),
         KeyBinding::new("shift-a", WriteAtEnd, not_writing),
+        KeyBinding::new("space", ToggleTodos, not_writing),
         KeyBinding::new("alt-left", MoveWordLeft, editor),
         KeyBinding::new("alt-right", MoveWordRight, editor),
         KeyBinding::new("alt-shift-left", SelectWordLeft, editor),
@@ -1582,18 +1584,39 @@ impl Editor {
         });
     }
 
-    fn toggle_todo(&mut self, id: BlockId, cx: &mut Context<Self>) {
+    fn toggle_selected_todos(
+        &mut self,
+        _: &ToggleTodos,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Selection::Blocks { anchor, head } = self.selection {
+            let blocks = self.document.siblings_between(anchor, head);
+            self.toggle_todos(&blocks, cx);
+        }
+    }
+
+    /// Checks the to-dos among `blocks`, unless all of them are checked already, when they
+    /// are unchecked. The to-dos nested in them keep their state.
+    fn toggle_todos(&mut self, blocks: &[BlockId], cx: &mut Context<Self>) {
+        let checked = blocks.iter().any(|id| {
+            self.document
+                .block(*id)
+                .is_some_and(|block| block.kind == BlockKind::Todo { checked: false })
+        });
         self.transact(EditKind::Other, cx, |this| {
-            match this.document.block_mut(id) {
-                Some(Block {
-                    kind: BlockKind::Todo { checked },
+            let mut changed = false;
+            for id in blocks {
+                if let Some(Block {
+                    kind: BlockKind::Todo { checked: state },
                     ..
-                }) => {
-                    *checked = !*checked;
-                    true
+                }) = this.document.block_mut(*id)
+                {
+                    *state = checked;
+                    changed = true;
                 }
-                _ => false,
             }
+            changed
         });
     }
 
@@ -2136,7 +2159,7 @@ impl Editor {
                                     MouseButton::Left,
                                     cx.listener(move |this, _, _, cx| {
                                         cx.stop_propagation();
-                                        this.toggle_todo(id, cx);
+                                        this.toggle_todos(&[id], cx);
                                     }),
                                 ),
                         )
@@ -2390,6 +2413,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::toggle_italic))
             .on_action(cx.listener(Self::toggle_code))
             .on_action(cx.listener(Self::toggle_strikethrough))
+            .on_action(cx.listener(Self::toggle_selected_todos))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .on_mouse_move(cx.listener(Self::mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))

@@ -18,7 +18,7 @@ use crate::theme::Theme;
 // note.
 /// How wide the thumb is, and with it the track: the strip along the right edge that reacts
 /// to the pointer.
-pub(crate) const WIDTH: Pixels = px(10.);
+pub(crate) const WIDTH: Pixels = px(14.);
 /// The thumb of a long note does not get shorter than this.
 const MIN_THUMB_LENGTH: Pixels = px(24.);
 /// How long the scrollbar stays after it was last used, where the system hides scrollbars.

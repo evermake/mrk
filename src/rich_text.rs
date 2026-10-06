@@ -180,6 +180,15 @@ impl RichText {
         }
     }
 
+    /// A copy of the text in `range`, with its styles.
+    pub fn slice(&self, range: Range<usize>) -> RichText {
+        let range = self.clamp_range(range);
+        let mut slice = self.clone();
+        slice.delete(range.end..self.len());
+        slice.delete(0..range.start);
+        slice
+    }
+
     /// Drops all inline styles, keeping only the text.
     pub fn to_plain(&self) -> RichText {
         RichText::plain(&self.text)
@@ -428,6 +437,26 @@ mod tests {
 
         text.append(tail);
         assert_eq!(text, original);
+    }
+
+    #[test]
+    fn slice_keeps_the_styles_of_the_range() {
+        let mut text = RichText::plain("one two three");
+        text.set_mark(4..7, Mark::Bold, true);
+
+        let slice = text.slice(2..9);
+        assert_eq!(slice.text(), "e two t");
+        assert_eq!(
+            describe(&slice),
+            vec![("e ", false), ("two", true), (" t", false)]
+        );
+        assert_invariants(&slice);
+
+        assert!(text.slice(5..5).is_empty());
+        assert_eq!(text.slice(0..text.len()), text);
+        assert_eq!(text.slice(9..99).text(), "hree");
+        // The text itself is untouched.
+        assert_eq!(text.text(), "one two three");
     }
 
     #[test]

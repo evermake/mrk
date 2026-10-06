@@ -1,9 +1,17 @@
-use std::collections::HashSet;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use crate::rich_text::RichText;
 
 pub type BlockId = u64;
+
+/// A place in the text of a block, as a byte offset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextPosition {
+    pub block: BlockId,
+    pub offset: usize,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlockKind {
@@ -386,6 +394,165 @@ impl Document {
             .into_iter()
             .filter_map(|id| self.block(id).cloned())
             .collect()
+    }
+
+    /// Where two blocks are in document order, which is top to bottom as displayed.
+    pub fn order(&self, first: BlockId, second: BlockId) -> Option<Ordering> {
+        // Paths compare like document order does: a block is followed by its children.
+        Some(self.path_of(first)?.cmp(&self.path_of(second)?))
+    }
+
+    /// `first` and `second` as (earlier, later) in document order.
+    pub fn in_order(
+        &self,
+        first: TextPosition,
+        second: TextPosition,
+    ) -> Option<(TextPosition, TextPosition)> {
+        let ordering = if first.block == second.block {
+            first.offset.cmp(&second.offset)
+        } else {
+            self.order(first.block, second.block)?
+        };
+        Some(if ordering == Ordering::Greater {
+            (second, first)
+        } else {
+            (first, second)
+        })
+    }
+
+    /// The smallest run of siblings that includes both blocks, which may be nested at
+    /// different depths: what block operations act on when text is selected across blocks.
+    pub fn covering_siblings(&self, first: BlockId, second: BlockId) -> Option<(BlockId, BlockId)> {
+        let first_path = self.path_of(first)?;
+        let second_path = self.path_of(second)?;
+        let shared = first_path
+            .iter()
+            .zip(&second_path)
+            .take_while(|(first, second)| first == second)
+            .count();
+        // When one block holds the other, the holder is the run.
+        let depth = shared.min(first_path.len().min(second_path.len()) - 1);
+        let covering = |path: &[usize]| self.block_at(&path[..=depth]).map(|block| block.id);
+        Some((covering(&first_path)?, covering(&second_path)?))
+    }
+
+    fn blocks_in_order(&self) -> Vec<&Block> {
+        fn visit<'a>(blocks: &'a [Block], order: &mut Vec<&'a Block>) {
+            for block in blocks {
+                order.push(block);
+                visit(&block.children, order);
+            }
+        }
+        let mut order = Vec::new();
+        visit(&self.blocks, &mut order);
+        order
+    }
+
+    /// Every block from `start` to `end` (in document order) with the part of its text that
+    /// lies between them. That is all of the text of the blocks in between, and nothing for
+    /// blocks that have none.
+    pub fn span_ranges(
+        &self,
+        start: TextPosition,
+        end: TextPosition,
+    ) -> Vec<(&Block, Range<usize>)> {
+        let order = self.blocks_in_order();
+        let first = order.iter().position(|block| block.id == start.block);
+        let last = order.iter().position(|block| block.id == end.block);
+        let Some(blocks) = first
+            .zip(last)
+            .and_then(|(first, last)| order.get(first..=last))
+        else {
+            return Vec::new();
+        };
+        blocks
+            .iter()
+            .map(|block| {
+                let length = block.text.len();
+                let from = if block.id == start.block {
+                    start.offset.min(length)
+                } else {
+                    0
+                };
+                let to = if block.id == end.block {
+                    end.offset.min(length)
+                } else {
+                    length
+                };
+                (*block, from..to.max(from))
+            })
+            .collect()
+    }
+
+    /// Copies of the blocks between `start` and `end`, cut to the text in between. A block
+    /// keeps the children that are in the span too; the children of a block that is not in
+    /// it are taken up by its nearest ancestor that is, or end up at the top level.
+    pub fn copy_span(&self, start: TextPosition, end: TextPosition) -> Vec<Block> {
+        fn copy(blocks: &[Block], ranges: &HashMap<BlockId, Range<usize>>) -> Vec<Block> {
+            let mut copies = Vec::new();
+            for block in blocks {
+                let children = copy(&block.children, ranges);
+                match ranges.get(&block.id) {
+                    Some(range) => copies.push(
+                        Block::new(block.kind.clone(), block.text.slice(range.clone()))
+                            .with_children(children),
+                    ),
+                    None => copies.extend(children),
+                }
+            }
+            copies
+        }
+        let ranges = self
+            .span_ranges(start, end)
+            .into_iter()
+            .map(|(block, range)| (block.id, range))
+            .collect();
+        copy(&self.blocks, &ranges)
+    }
+
+    /// Deletes the text between `start` and `end`, which are in different blocks and in
+    /// document order. The blocks between them go, and so does the text up to `end` in the
+    /// last block; then the rest of the last block joins the first block, which keeps its
+    /// type. They stay apart when only one of them holds literal text (a code block). What
+    /// is nested in a block that goes stays, in its place. Returns where the caret belongs
+    /// afterwards.
+    pub fn delete_span(&mut self, start: TextPosition, end: TextPosition) -> Option<TextPosition> {
+        let between: Vec<BlockId> = {
+            let order = self.blocks_in_order();
+            let first = order.iter().position(|block| block.id == start.block)?;
+            let last = order.iter().position(|block| block.id == end.block)?;
+            if first >= last {
+                return None;
+            }
+            order[first + 1..last]
+                .iter()
+                .map(|block| block.id)
+                .collect()
+        };
+        for id in between {
+            self.take_promoting_children(id);
+        }
+
+        let last = self.block_mut(end.block)?;
+        let end_offset = last.text.clamp(end.offset);
+        last.text.delete(0..end_offset);
+        let first = self.block_mut(start.block)?;
+        let offset = first.text.clamp(start.offset);
+        let length = first.text.len();
+        first.text.delete(offset..length);
+
+        let (first, last) = (self.block(start.block)?, self.block(end.block)?);
+        let joins = first.kind.has_text()
+            && last.kind.has_text()
+            && first.kind.is_verbatim() == last.kind.is_verbatim();
+        if joins {
+            let removed = self.take_promoting_children(end.block)?;
+            self.block_mut(start.block)?.text.append(removed.text);
+        }
+        Some(TextPosition {
+            block: start.block,
+            offset,
+        })
     }
 
     /// Nests the selected siblings under the sibling right above them.
@@ -850,6 +1017,171 @@ mod tests {
             document
                 .subtree_ids(document.find("a1"), document.find("b"))
                 .is_empty()
+        );
+    }
+
+    fn at(document: &Document, text: &str, offset: usize) -> TextPosition {
+        TextPosition {
+            block: document.find(text),
+            offset,
+        }
+    }
+
+    #[test]
+    fn blocks_are_ordered_as_displayed() {
+        let document = document(NESTED);
+        let (a, a2x, b) = (document.find("a"), document.find("a2x"), document.find("b"));
+        assert_eq!(document.order(a, a2x), Some(Ordering::Less));
+        assert_eq!(document.order(b, a2x), Some(Ordering::Greater));
+        assert_eq!(document.order(b, b), Some(Ordering::Equal));
+        assert_eq!(document.order(b, 999), None);
+
+        let (early, late) = (at(&document, "a2", 1), at(&document, "b", 0));
+        assert_eq!(document.in_order(early, late), Some((early, late)));
+        assert_eq!(document.in_order(late, early), Some((early, late)));
+        let (before, after) = (at(&document, "b", 0), at(&document, "b", 1));
+        assert_eq!(document.in_order(after, before), Some((before, after)));
+    }
+
+    #[test]
+    fn covering_siblings_lift_both_blocks_to_one_level() {
+        let document = document(NESTED);
+        let find = |text| document.find(text);
+        for ((first, second), expected) in [
+            (("a2x", "b"), ("a", "b")),
+            (("a1", "a3"), ("a1", "a3")),
+            (("a2x", "a1"), ("a2", "a1")),
+            // A block holding the other one is the run.
+            (("a", "a2x"), ("a", "a")),
+            (("a2x", "a"), ("a", "a")),
+            (("b", "b"), ("b", "b")),
+        ] {
+            assert_eq!(
+                document.covering_siblings(find(first), find(second)),
+                Some((find(expected.0), find(expected.1))),
+                "{first} and {second}"
+            );
+        }
+    }
+
+    #[test]
+    fn span_ranges_cover_the_text_between_two_positions() {
+        let document = document("one\n\n---\n\n- two\n  - three\n\nfour\n");
+        let ranges = document.span_ranges(at(&document, "one", 1), at(&document, "three", 2));
+        let described: Vec<(String, Range<usize>)> = ranges
+            .into_iter()
+            .map(|(block, range)| (block.text.text().to_string(), range))
+            .collect();
+        assert_eq!(
+            described,
+            [
+                ("one".to_string(), 1..3),
+                (String::new(), 0..0),
+                ("two".to_string(), 0..3),
+                ("three".to_string(), 0..2),
+            ]
+        );
+        // Backwards, or between blocks that do not exist, there is nothing.
+        assert!(
+            document
+                .span_ranges(at(&document, "four", 0), at(&document, "one", 0))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn delete_span_joins_the_ends_and_removes_what_is_between() {
+        let mut document = document(NESTED);
+        let a2 = document.find("a2");
+        let caret = document.delete_span(at(&document, "a2", 1), at(&document, "b", 0));
+        // `a2x` and `a3` were between the ends, and the text of `b` joined `a2`.
+        assert_eq!(document.outline(), "- a\n  - a1\n  - ab\n- c\n");
+        assert_eq!(
+            caret,
+            Some(TextPosition {
+                block: a2,
+                offset: 1
+            })
+        );
+    }
+
+    #[test]
+    fn delete_span_keeps_the_type_of_the_first_block() {
+        let mut document = document("# Title\n\n- item\n");
+        let caret = document.delete_span(at(&document, "Title", 2), at(&document, "item", 2));
+        assert_eq!(document.outline(), "h1 Tiem\n");
+        assert_eq!(caret.map(|caret| caret.offset), Some(2));
+    }
+
+    #[test]
+    fn delete_span_leaves_nested_blocks_outside_the_span_in_place() {
+        // `a2x` is inside the span, and `a3` is not.
+        let mut document = document(NESTED);
+        document.delete_span(at(&document, "a1", 1), at(&document, "a2x", 1));
+        assert_eq!(document.outline(), "- a\n  - a2x\n  - a3\n- b\n- c\n");
+
+        // `a2` has children outside the span, which stay where its text was.
+        let mut document = self::document(NESTED);
+        document.delete_span(at(&document, "a", 1), at(&document, "a2", 1));
+        assert_eq!(document.outline(), "- a2\n  - a2x\n  - a3\n- b\n- c\n");
+
+        // `x` is between the ends and holds the end block, so what was nested in it moves up.
+        let mut document = self::document("para\n\n- x\n  - y\n  - z\n");
+        document.delete_span(at(&document, "para", 2), at(&document, "y", 1));
+        assert_eq!(document.outline(), "p pa\n- z\n");
+    }
+
+    #[test]
+    fn delete_span_removes_dividers_between_the_ends() {
+        let mut document = document("ab\n\n---\n\ncd\n");
+        document.delete_span(at(&document, "ab", 1), at(&document, "cd", 1));
+        assert_eq!(document.outline(), "p ad\n");
+    }
+
+    #[test]
+    fn delete_span_does_not_mix_code_and_text() {
+        let mut document = document("```\ncode\n```\n\ntext\n");
+        let caret = document.delete_span(at(&document, "code", 2), at(&document, "text", 2));
+        assert_eq!(document.outline(), "code() co\np xt\n");
+        assert_eq!(caret.map(|caret| caret.offset), Some(2));
+
+        let mut document = self::document("```\none\n```\n\n```\ntwo\n```\n");
+        document.delete_span(at(&document, "one", 1), at(&document, "two", 1));
+        assert_eq!(document.outline(), "code() owo\n");
+    }
+
+    #[test]
+    fn delete_span_ignores_positions_that_are_not_in_order() {
+        let mut document = document("one\n\ntwo\n");
+        let (one, two) = (at(&document, "one", 0), at(&document, "two", 0));
+        assert_eq!(document.delete_span(two, one), None);
+        assert_eq!(document.delete_span(one, one), None);
+        assert_eq!(document.outline(), "p one\np two\n");
+    }
+
+    #[test]
+    fn copy_span_cuts_the_ends_and_keeps_the_nesting() {
+        let document = document(NESTED);
+        let copy = |start, end| Document::from_blocks(document.copy_span(start, end)).outline();
+
+        // `a` is not in the span, so what is nested in it comes out at the top level.
+        assert_eq!(
+            copy(at(&document, "a1", 1), at(&document, "b", 1)),
+            "- 1\n- a2\n  - a2x\n- a3\n- b\n"
+        );
+        // A block in the span keeps the children that are in it.
+        assert_eq!(
+            copy(at(&document, "a", 0), at(&document, "a2", 1)),
+            "- a\n  - a1\n  - a\n"
+        );
+        // The divider has no text but is part of the copy.
+        let document = self::document("one\n\n---\n\n# two\n");
+        assert_eq!(
+            Document::from_blocks(
+                document.copy_span(at(&document, "one", 1), at(&document, "two", 2))
+            )
+            .outline(),
+            "p ne\n---\nh1 tw\n"
         );
     }
 

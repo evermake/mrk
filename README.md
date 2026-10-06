@@ -148,6 +148,15 @@ Typing a marker at the start of a paragraph, followed by a space, converts the b
 actual size, as in a browser. The steps run from 50% to 300%, and the part of the note in view
 stays in view. The same commands are in the View menu.
 
+### Scrollbar
+
+A note longer than the window has a scrollbar on its right edge. The thumb is as long as the
+share of the note that is in view, and sits where that part is in the note. Dragging the thumb
+scrolls, and pressing the track above or below it brings the thumb to the pointer.
+
+It follows "Show scroll bars" in the macOS Appearance settings: it is either always there, or
+shows while scrolling and while the pointer is at the right edge, and when a note opens.
+
 ### Files
 
 - `Cmd+O` open, `Cmd+N` new, `Cmd+S` save, `Cmd+Shift+S` save as.
@@ -171,6 +180,7 @@ stays in view. The same commands are in the View menu.
 - `src/document.rs`, `src/rich_text.rs`: the block tree and styled text.
 - `src/markdown.rs`: conversion to and from Markdown.
 - `src/editor.rs`, `src/block_text.rs`: the editor view and its text element.
+- `src/scrollbar.rs`: the scrollbar of the note.
 - `src/workspace.rs`: the window, file handling and backups.
 
 The editor's tests press real keys and compare the resulting document (`src/editor/tests.rs`).

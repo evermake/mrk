@@ -3,6 +3,7 @@ use pretty_assertions::assert_eq;
 
 use super::*;
 
+mod scrollbar;
 mod selection_across_blocks;
 mod typing_shortcuts;
 mod word_selection;

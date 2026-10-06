@@ -14,6 +14,9 @@ pub struct Theme {
     pub text_selection: Hsla,
     pub block_selection: Hsla,
     pub code_background: Hsla,
+    pub scrollbar_thumb: Hsla,
+    /// Behind the thumb, while the pointer is on the scrollbar.
+    pub scrollbar_track: Hsla,
 }
 
 impl Theme {
@@ -30,6 +33,8 @@ impl Theme {
                 text_selection: rgba(0x5b9dff59).into(),
                 block_selection: rgba(0x5b9dff2e).into(),
                 code_background: rgb(0x26282c).into(),
+                scrollbar_thumb: rgba(0xffffff66).into(),
+                scrollbar_track: rgba(0xffffff12).into(),
             },
             WindowAppearance::Light | WindowAppearance::VibrantLight => Self {
                 background: rgb(0xffffff).into(),
@@ -42,6 +47,8 @@ impl Theme {
                 text_selection: rgba(0x2f6feb40).into(),
                 block_selection: rgba(0x2f6feb1f).into(),
                 code_background: rgb(0xf3f4f6).into(),
+                scrollbar_thumb: rgba(0x00000066).into(),
+                scrollbar_track: rgba(0x0000000f).into(),
             },
         }
     }

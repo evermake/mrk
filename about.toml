@@ -1,0 +1,21 @@
+# What cargo-about collects into THIRD-PARTY-LICENSES.md, the notices that ship with the
+# binary. The Release workflow generates it; a dependency whose license is not accepted
+# below fails the release. Reference: https://embarkstudios.github.io/cargo-about
+
+# In order of preference when a crate offers a choice.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "Unicode-3.0",
+    "bzip2-1.0.6",
+    # Copyleft per file, which an unmodified dependency satisfies: option-ext, used by dirs.
+    "MPL-2.0",
+]
+
+# Only what is linked into the released binary.
+targets = ["aarch64-apple-darwin"]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true

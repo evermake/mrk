@@ -45,7 +45,23 @@ Like visual mode in Vim, but blocks are selected instead of lines.
 - Internal doc structure is represented as blocks and conversion happens on open/save/export.
 - Before saving, if conversion is loses something (not 1:1), should create a `.bak`-suffixed backup of the file.
 
-## Running
+## Installing
+
+Every [release](https://github.com/evermake/mrk/releases) has a build for Apple Silicon Macs.
+Download it and unpack it in a terminal:
+
+```sh
+tar -xzf mrk-v0.1.0-aarch64-apple-darwin.tar.gz
+./mrk-v0.1.0-aarch64-apple-darwin/mrk note.md
+```
+
+The build is not signed. Unpacked with `tar` it runs as it is. Unpacked by double-clicking in
+Finder it is quarantined by macOS, which `xattr -d com.apple.quarantine mrk` lifts.
+
+Next to the binary are mrk's licenses and `THIRD-PARTY-LICENSES.md`, the licenses of
+everything it is built from.
+
+## Running from source
 
 Needs a recent stable Rust and Xcode.
 
@@ -144,3 +160,52 @@ row there, and a new key binding as a test that fails without it.
 
 `cargo run --example screenshot -- note.md out.png "down down enter"` renders a file to a PNG
 without opening a window, optionally after replaying keystrokes.
+
+## Releasing
+
+Pull requests are squash-merged and the title becomes the commit on `main`, so the title is a
+[Conventional Commit](https://www.conventionalcommits.org); the "PR title" check enforces
+that. [release-plz](https://release-plz.dev) reads those commits to choose the next version
+and to write `CHANGELOG.md`, so a title is written for the people who read release notes.
+
+| Title | Release notes | Version |
+| --- | --- | --- |
+| `feat: …` | Added | 0.1.0 → 0.1.1 |
+| `fix: …` | Fixed | 0.1.0 → 0.1.1 |
+| `perf: …` | Changed | 0.1.0 → 0.1.1 |
+| `refactor`, `docs`, `test`, `chore`, `ci`, `build`, `revert` | not listed | no release of their own |
+| any type with `!`, as in `feat!: …` | marked as breaking | 0.1.0 → 0.2.0 |
+
+Before 1.0 the middle number is the breaking one, which is how Cargo reads `0.x` versions.
+From 1.0 on, `feat` bumps the middle number and a breaking change the first.
+
+To release, run the Release workflow from the Actions tab, or:
+
+```sh
+gh workflow run release.yml                  # release
+gh workflow run release.yml -f dry_run=true  # show and build what would be released
+```
+
+It updates the version and the changelog, runs the tests, builds, pushes a
+`chore: release vX.Y.Z` commit to `main`, tags it and publishes a GitHub release with the
+binary attached. A dry run stops after the build and keeps the binary as a workflow
+artifact. Running the workflow again finishes a release that failed halfway.
+
+The download also carries the licenses of the crates linked into the binary, collected by
+[cargo-about](https://github.com/EmbarkStudios/cargo-about). `about.toml` lists the licenses
+that are accepted, and a dependency under any other license fails the release until its
+license is reviewed and added there.
+
+The setup lives in `release-plz.toml`, `about.toml`, `about.hbs` and `.github/workflows/`. It
+relies on one repository setting: squash merges use the pull request title as the commit title (Settings → General →
+Pull Requests). With GitHub's default, a pull request with a single commit is merged under
+that commit's message instead.
+
+## License
+
+Licensed under either of the [Apache License, Version 2.0](LICENSE-APACHE) or the
+[MIT license](LICENSE-MIT), at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion
+in mrk by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without
+any additional terms or conditions.

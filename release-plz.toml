@@ -1,0 +1,24 @@
+# How release-plz computes the next version and writes CHANGELOG.md.
+# It is run by the Release workflow (.github/workflows/release.yml).
+# Reference: https://release-plz.dev/docs/config
+
+[workspace]
+# mrk is not published to crates.io, so the released version is the latest `v*` git tag.
+git_only = true
+# cargo-semver-checks compares library APIs; mrk is an application.
+semver_check = false
+# The workflow attaches the binary to the release and only then publishes it.
+git_release_draft = true
+# A release needs a change that users notice (feat, fix, perf) or a breaking change of any type.
+release_commits = '^(feat|fix|perf)(\(.+\))?!?:|^[a-z]+(\(.+\))?!:'
+
+[changelog]
+# A breaking change is listed whatever its type.
+protect_breaking_commits = true
+commit_parsers = [
+    { message = "^feat", group = "added" },
+    { message = "^fix", group = "fixed" },
+    { message = "^perf", group = "changed" },
+    # The rest (chore, ci, docs, refactor, test, …) stays out of the release notes.
+    { message = "^.*", group = "other", skip = true },
+]

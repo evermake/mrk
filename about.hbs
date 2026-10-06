@@ -1,0 +1,23 @@
+# Third-party licenses
+
+mrk is built from the open-source software listed below, under these licenses:
+
+{{#each overview}}
+- {{{name}}}
+{{/each}}
+{{#each licenses}}
+{{#unless (eq used_by.[0].crate.name "mrk")}}
+
+## {{{name}}}
+
+Used by:
+
+{{#each used_by}}
+- {{{crate.name}}} {{{crate.version}}}{{#if crate.repository}}, {{{crate.repository}}}{{/if}}
+{{/each}}
+
+```
+{{{text}}}
+```
+{{/unless}}
+{{/each}}

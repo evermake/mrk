@@ -869,6 +869,34 @@ fn enter_on_a_divider_writes_below_it(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn backspace_in_an_empty_block_below_a_divider_keeps_the_divider(cx: &mut TestAppContext) {
+    let (editor, mut cx) = open("above\n\n---\n", cx);
+    cx.simulate_keystrokes("up enter");
+    assert_eq!(state(&editor, &mut cx), "p above\n---\np ˇ\n");
+    cx.simulate_keystrokes("backspace");
+    assert_eq!(state(&editor, &mut cx), "p aboveˇ\n---\n");
+    assert_eq!(mode(&editor, &mut cx), Mode::Writing);
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(state(&editor, &mut cx), "p above\n---\np ˇ\n");
+}
+
+#[gpui::test]
+fn backspace_below_a_divider_with_no_text_above_removes_the_divider(cx: &mut TestAppContext) {
+    let (editor, mut cx) = open("---\n", cx);
+    cx.simulate_keystrokes("down enter backspace");
+    assert_eq!(state(&editor, &mut cx), "p ˇ\n");
+}
+
+#[gpui::test]
+fn backspace_at_the_start_of_text_below_a_divider_removes_the_divider(cx: &mut TestAppContext) {
+    let (editor, mut cx) = open("above\n\n---\n\nbelow\n", cx);
+    cx.simulate_keystrokes("up enter cmd-left backspace");
+    assert_eq!(state(&editor, &mut cx), "p above\np ˇbelow\n");
+    cx.simulate_keystrokes("backspace");
+    assert_eq!(state(&editor, &mut cx), "p aboveˇbelow\n");
+}
+
+#[gpui::test]
 fn bold_and_italic_toggle_on_the_selection(cx: &mut TestAppContext) {
     let (editor, mut cx) = open("hello world\n", cx);
     cx.simulate_keystrokes("down enter alt-shift-left cmd-b");

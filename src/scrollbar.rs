@@ -1,7 +1,8 @@
 //! The scrollbar of the note. GPUI draws the whole window itself, so this is not the system's
-//! scrollbar but mrk's own: a plain bar over the right edge of the note, whose thumb is as
-//! long as the share of the note that is in view and placed where that part is. Dragging the
-//! thumb scrolls, and pressing the track above or below it brings the thumb there.
+//! scrollbar but mrk's own: a plain track over the right edge of the note, with a thumb that
+//! is as long as the share of the note that is in view and placed where that part is.
+//! Dragging the thumb scrolls, and pressing the track above or below it brings the thumb
+//! there.
 
 use std::time::{Duration, Instant};
 
@@ -238,6 +239,7 @@ impl Scrollbar {
 impl Render for Scrollbar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_appearance(window.appearance());
+        let track_color = theme.scrollbar_track;
         let (color, active_color) = (theme.scrollbar_thumb, theme.scrollbar_thumb_active);
         let scrollbar = cx.entity();
         canvas(
@@ -266,6 +268,8 @@ impl Render for Scrollbar {
                 let opacity = this.opacity(cx);
 
                 if opacity > 0. {
+                    // The track shows where pressing scrolls.
+                    window.paint_quad(fill(track, track_color.opacity(opacity)));
                     let thumb = Bounds::new(
                         point(track.left(), thumb.top),
                         size(track.size.width, thumb.length),

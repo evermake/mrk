@@ -26,6 +26,7 @@ Like visual mode in Vim, but blocks are selected instead of lines.
 - `Shift+Tab` moves the selected block out of it's parent. If there are other blocks that were after the selected block inside nested parent, they became nested in the moved block (i.e. vertical order of blocks stays the same)
 - `Shift` + arrows selects multiple blocks at once.
 - `Backspace` / `Delete` deletes selected blocks
+- `Space` checks the selected to-dos, or unchecks them when all of them are checked
 - `Alt+Up`, `Alt+Down` re-order blocks
 
 `h`, `j`, `k`, `l` keys work like arrows.
@@ -99,6 +100,9 @@ and saved back unchanged.
   With nothing selected they do nothing.
 - `Esc` clears the selection.
 - `d` deletes the selected blocks, like `Backspace`.
+- `Space` toggles the selected to-dos together: if any of them is unchecked they all get
+  checked, otherwise they all get unchecked. It acts like clicking their checkboxes, so the
+  to-dos nested in them keep their state, and selected blocks of other types are left alone.
 - `o` / `Shift+O` add an empty block below / above the selection, at its nesting level, and
   start writing in it. Next to a list item, numbered item or to-do it is another one (a to-do
   starts unchecked); next to anything else it is a paragraph. Below a block means below

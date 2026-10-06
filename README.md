@@ -126,6 +126,8 @@ Typing a marker at the start of a paragraph, followed by a space, converts the b
 - `Tab` / `Shift+Tab` and `Alt+Up` / `Alt+Down` act on the block being written in.
 - `Cmd+E` toggles inline code and `Cmd+Shift+X` strikethrough.
 - `Cmd`-click opens a link.
+- Double-click selects a word; holding the button down on the second click and dragging
+  selects whole words, across blocks too.
 - A text selection can run across blocks. `Shift` + arrows (and `Shift`-click or dragging
   the mouse) extend it past the edge of a block into the next one, and `Cmd+A` selects the
   text of the block, then of the whole note. Typing, `Enter`, `Backspace`/`Delete` and paste

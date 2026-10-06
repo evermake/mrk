@@ -402,18 +402,22 @@ impl Document {
         Some(self.path_of(first)?.cmp(&self.path_of(second)?))
     }
 
+    /// Where two text positions are in document order.
+    pub fn compare(&self, first: TextPosition, second: TextPosition) -> Option<Ordering> {
+        if first.block == second.block {
+            Some(first.offset.cmp(&second.offset))
+        } else {
+            self.order(first.block, second.block)
+        }
+    }
+
     /// `first` and `second` as (earlier, later) in document order.
     pub fn in_order(
         &self,
         first: TextPosition,
         second: TextPosition,
     ) -> Option<(TextPosition, TextPosition)> {
-        let ordering = if first.block == second.block {
-            first.offset.cmp(&second.offset)
-        } else {
-            self.order(first.block, second.block)?
-        };
-        Some(if ordering == Ordering::Greater {
+        Some(if self.compare(first, second)? == Ordering::Greater {
             (second, first)
         } else {
             (first, second)

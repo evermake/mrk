@@ -243,6 +243,20 @@ enum Unit {
     Line,
 }
 
+/// What moving the mouse selects while its button is held down, as the click that pressed
+/// it decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Drag {
+    /// Text from the click up to the pointer.
+    Characters,
+    /// Whole words, from the word that was double-clicked (`start` to `end`) up to the word
+    /// under the pointer.
+    Words {
+        start: TextPosition,
+        end: TextPosition,
+    },
+}
+
 struct Snapshot {
     document: Document,
     selection: Selection,
@@ -276,7 +290,7 @@ pub struct Editor {
     scroll_handle: ScrollHandle,
     focus_handle: FocusHandle,
     needs_autoscroll: bool,
-    is_selecting: bool,
+    drag: Option<Drag>,
     caret_visible: bool,
     blink_task: Option<Task<()>>,
 }
@@ -304,7 +318,7 @@ impl Editor {
             scroll_handle: ScrollHandle::new(),
             focus_handle: cx.focus_handle(),
             needs_autoscroll: false,
-            is_selecting: false,
+            drag: None,
             caret_visible: true,
             blink_task: None,
         }
@@ -1735,26 +1749,42 @@ impl Editor {
             return;
         }
         let text = block.text.text();
+        self.drag = None;
         let selection = match event.click_count {
-            1 => match self.text_endpoints() {
-                // Shift extends the selection from where it started, into any block.
-                Some((anchor, _)) if event.modifiers.shift => {
-                    text_selection_between(anchor, TextPosition { block: id, offset })
+            1 => {
+                self.drag = Some(Drag::Characters);
+                match self.text_endpoints() {
+                    // Shift extends the selection from where it started, into any block.
+                    Some((anchor, _)) if event.modifiers.shift => {
+                        text_selection_between(anchor, TextPosition { block: id, offset })
+                    }
+                    _ => Selection::Text(TextSelection::caret(id, offset)),
                 }
-                _ => Selection::Text(TextSelection::caret(id, offset)),
-            },
-            2 => Selection::Text(TextSelection {
-                block: id,
-                range: word_range(text, offset),
-                reversed: false,
-            }),
+            }
+            2 => {
+                let range = word_range(text, offset);
+                self.drag = Some(Drag::Words {
+                    start: TextPosition {
+                        block: id,
+                        offset: range.start,
+                    },
+                    end: TextPosition {
+                        block: id,
+                        offset: range.end,
+                    },
+                });
+                Selection::Text(TextSelection {
+                    block: id,
+                    range,
+                    reversed: false,
+                })
+            }
             _ => Selection::Text(TextSelection {
                 block: id,
                 range: 0..text.len(),
                 reversed: false,
             }),
         };
-        self.is_selecting = event.click_count == 1;
         self.set_selection(selection, cx);
         self.caret_upstream = upstream;
     }
@@ -1783,21 +1813,54 @@ impl Editor {
     }
 
     fn mouse_move(&mut self, event: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        if !self.is_selecting || !event.dragging() {
+        if !event.dragging() {
             return;
         }
-        let Some((anchor, head)) = self.text_endpoints() else {
+        let Some(drag) = self.drag else {
             return;
         };
-        if let Some(position) = self.position_for_drag(event.position, anchor)
-            && position != head
-        {
-            self.select_text(anchor, position, cx);
+        let Some((current_anchor, current_head)) = self.text_endpoints() else {
+            return;
+        };
+        let (anchor, head) = match drag {
+            Drag::Characters => {
+                let Some(position) = self.position_for_drag(event.position, current_anchor) else {
+                    return;
+                };
+                (current_anchor, position)
+            }
+            Drag::Words { start, end } => {
+                let Some(position) = self.position_for_drag(event.position, start) else {
+                    return;
+                };
+                let Some(block) = self.document.block(position.block) else {
+                    return;
+                };
+                let word = word_range(block.text.text(), position.offset);
+                let word_start = TextPosition {
+                    block: position.block,
+                    offset: word.start,
+                };
+                let word_end = TextPosition {
+                    block: position.block,
+                    offset: word.end,
+                };
+                // The selection always holds the word that was double-clicked and the one
+                // under the pointer, whichever side of it that is.
+                if self.document.compare(word_start, start) == Some(Ordering::Less) {
+                    (end, word_start)
+                } else {
+                    (start, word_end)
+                }
+            }
+        };
+        if (anchor, head) != (current_anchor, current_head) {
+            self.select_text(anchor, head, cx);
         }
     }
 
     fn mouse_up(&mut self, _: &MouseUpEvent, _window: &mut Window, _cx: &mut Context<Self>) {
-        self.is_selecting = false;
+        self.drag = None;
     }
 
     /// Scrolls so that the caret, or the selected block, is inside the viewport. It runs

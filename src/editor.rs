@@ -52,6 +52,8 @@ pub mod actions {
             NewBlockBelow,
             OpenBelow,
             OpenAbove,
+            WriteAtStart,
+            WriteAtEnd,
             Escape,
             Backspace,
             Delete,
@@ -81,7 +83,7 @@ use actions::{
     MoveToLineStart, MoveUp, MoveWordLeft, MoveWordRight, NewBlockBelow, OpenAbove, OpenBelow,
     Outdent, Paste, Redo, SelectAll, SelectDown, SelectLeft, SelectRight, SelectToLineEnd,
     SelectToLineStart, SelectUp, SelectWordLeft, SelectWordRight, ToggleBold, ToggleCode,
-    ToggleItalic, ToggleStrikethrough, Undo,
+    ToggleItalic, ToggleStrikethrough, Undo, WriteAtEnd, WriteAtStart,
 };
 
 const KEY_CONTEXT: &str = "Editor";
@@ -115,6 +117,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("d", Backspace, not_writing),
         KeyBinding::new("o", OpenBelow, not_writing),
         KeyBinding::new("shift-o", OpenAbove, not_writing),
+        KeyBinding::new("i", WriteAtStart, not_writing),
+        KeyBinding::new("shift-i", WriteAtStart, not_writing),
+        KeyBinding::new("a", WriteAtEnd, not_writing),
+        KeyBinding::new("shift-a", WriteAtEnd, not_writing),
         KeyBinding::new("alt-left", MoveWordLeft, editor),
         KeyBinding::new("alt-right", MoveWordRight, editor),
         KeyBinding::new("alt-shift-left", SelectWordLeft, editor),
@@ -524,17 +530,20 @@ impl Editor {
         }
     }
 
-    /// Enters writing mode at the end of `block`. A divider has no text to write in, so a
-    /// paragraph is added below it instead.
-    fn start_writing(&mut self, block: BlockId, cx: &mut Context<Self>) {
+    /// Enters writing mode at the start (`Backward`) or the end (`Forward`) of `block`. A
+    /// divider has no text to write in, so a paragraph is added before or after it instead.
+    fn start_writing(&mut self, block: BlockId, side: Direction, cx: &mut Context<Self>) {
         let Some(target) = self.document.block(block) else {
             return;
         };
         if target.kind.has_text() {
-            let offset = target.text.len();
+            let offset = match side {
+                Direction::Backward => 0,
+                Direction::Forward => target.text.len(),
+            };
             self.set_caret(block, offset, cx);
         } else {
-            self.write_in_new_block(block, Direction::Forward, BlockKind::Paragraph, cx);
+            self.write_in_new_block(block, side, BlockKind::Paragraph, cx);
         }
     }
 
@@ -1035,12 +1044,28 @@ impl Editor {
 
     fn enter(&mut self, _: &Enter, _window: &mut Window, cx: &mut Context<Self>) {
         match self.selection.clone() {
-            Selection::None => self.start_writing(self.document.last(), cx),
-            Selection::Blocks { head, .. } => self.start_writing(head, cx),
+            Selection::None => self.start_writing(self.document.last(), Direction::Forward, cx),
+            Selection::Blocks { head, .. } => self.start_writing(head, Direction::Forward, cx),
             Selection::Text(selection) => self.newline(selection, cx),
             Selection::Span { .. } => {
                 self.replace_span(cx, |this, caret, cx| this.newline(caret, cx));
             }
+        }
+    }
+
+    fn write_at_start(&mut self, _: &WriteAtStart, _window: &mut Window, cx: &mut Context<Self>) {
+        self.write_in_selected_block(Direction::Backward, cx);
+    }
+
+    fn write_at_end(&mut self, _: &WriteAtEnd, _window: &mut Window, cx: &mut Context<Self>) {
+        self.write_in_selected_block(Direction::Forward, cx);
+    }
+
+    /// Starts writing at the start or the end of the block the selection ends at, as `Enter`
+    /// does. With nothing selected there is no block to write in.
+    fn write_in_selected_block(&mut self, side: Direction, cx: &mut Context<Self>) {
+        if let Selection::Blocks { head, .. } = self.selection {
+            self.start_writing(head, side, cx);
         }
     }
 
@@ -2340,6 +2365,8 @@ impl Render for Editor {
             .on_action(cx.listener(Self::new_block_below))
             .on_action(cx.listener(Self::open_below))
             .on_action(cx.listener(Self::open_above))
+            .on_action(cx.listener(Self::write_at_start))
+            .on_action(cx.listener(Self::write_at_end))
             .on_action(cx.listener(Self::escape))
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))

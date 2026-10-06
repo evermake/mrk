@@ -21,6 +21,7 @@ Like visual mode in Vim, but blocks are selected instead of lines.
 - `Down`/`Up` arrows select either next/prev child (for nested blocks) or sibling (of selected block or parent's one if the last child is selected)
 - `Right`/`Left` arrows select 1st child/ancestor
 - `Enter` enters writing mode at the end of text content of the selected block
+- `i` / `Shift+I` enter writing mode at the beginning of the selected block, `a` / `Shift+A` at the end
 - `Tab` nests the selected block inside the sibling above (if block type supports nesting).
 - `Shift+Tab` moves the selected block out of it's parent. If there are other blocks that were after the selected block inside nested parent, they became nested in the moved block (i.e. vertical order of blocks stays the same)
 - `Shift` + arrows selects multiple blocks at once.
@@ -92,6 +93,10 @@ and saved back unchanged.
 - A selected block includes everything nested in it; `Shift` + `Up`/`Down` extends the
   selection over siblings.
 - `Enter` with nothing selected starts writing at the end of the document.
+- `i` / `Shift+I` start writing at the beginning of the selected block, and `a` / `Shift+A` at
+  its end, like `Enter`. With several blocks selected, it is the one the selection ends at.
+  A divider has no text, so a paragraph is added above it (`i`) or below it (`a`) to write in.
+  With nothing selected they do nothing.
 - `Esc` clears the selection.
 - `d` deletes the selected blocks, like `Backspace`.
 - `o` / `Shift+O` add an empty block below / above the selection, at its nesting level, and

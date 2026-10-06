@@ -483,11 +483,103 @@ fn enter_starts_writing_at_the_end_and_escape_selects_the_block(cx: &mut TestApp
 }
 
 #[gpui::test]
+fn i_writes_at_the_start_of_the_selected_block_and_a_at_the_end(cx: &mut TestAppContext) {
+    for (source, start, end) in [
+        ("text\n", "p ˇtext\n", "p textˇ\n"),
+        ("# Title\n", "h1 ˇTitle\n", "h1 Titleˇ\n"),
+        ("- item\n", "- ˇitem\n", "- itemˇ\n"),
+        ("1. item\n", "1. ˇitem\n", "1. itemˇ\n"),
+        ("- [x] done\n", "[x] ˇdone\n", "[x] doneˇ\n"),
+        ("> quote\n", "> ˇquote\n", "> quoteˇ\n"),
+        ("```\ncode\n```\n", "code() ˇcode\n", "code() codeˇ\n"),
+    ] {
+        for (key, expected) in [
+            ("i", start),
+            ("shift-i", start),
+            ("a", end),
+            ("shift-a", end),
+        ] {
+            let (editor, mut cx) = open(source, cx);
+            cx.simulate_keystrokes("down");
+            cx.simulate_keystrokes(key);
+            assert_eq!(state(&editor, &mut cx), expected, "{key} in {source:?}");
+            assert_eq!(mode(&editor, &mut cx), Mode::Writing, "{key} in {source:?}");
+        }
+    }
+}
+
+#[gpui::test]
+fn i_and_a_write_in_the_block_itself_not_in_what_is_nested_in_it(cx: &mut TestAppContext) {
+    for (keys, expected) in [
+        // `a2` is selected together with `a2x`, which is nested in it.
+        (
+            "down down down i",
+            "- a\n  - a1\n  - ˇa2\n    - a2x\n- b\n- c\n",
+        ),
+        (
+            "down down down a",
+            "- a\n  - a1\n  - a2ˇ\n    - a2x\n- b\n- c\n",
+        ),
+        // The selection ends at `a2` or at `a1`, and that is where the writing starts.
+        (
+            "down down shift-down i",
+            "- a\n  - a1\n  - ˇa2\n    - a2x\n- b\n- c\n",
+        ),
+        (
+            "down down shift-down a",
+            "- a\n  - a1\n  - a2ˇ\n    - a2x\n- b\n- c\n",
+        ),
+        (
+            "down down down shift-up i",
+            "- a\n  - ˇa1\n  - a2\n    - a2x\n- b\n- c\n",
+        ),
+        (
+            "down down down shift-up a",
+            "- a\n  - a1ˇ\n  - a2\n    - a2x\n- b\n- c\n",
+        ),
+    ] {
+        let (editor, mut cx) = open(NESTED, cx);
+        cx.simulate_keystrokes(keys);
+        assert_eq!(state(&editor, &mut cx), expected, "after {keys:?}");
+        assert_eq!(mode(&editor, &mut cx), Mode::Writing, "after {keys:?}");
+    }
+}
+
+#[gpui::test]
+fn i_and_a_write_in_a_new_paragraph_next_to_a_divider(cx: &mut TestAppContext) {
+    for (key, expected) in [("i", "p ˇ\n---\n"), ("a", "---\np ˇ\n")] {
+        let (editor, mut cx) = open("---\n", cx);
+        cx.simulate_keystrokes("down");
+        cx.simulate_keystrokes(key);
+        assert_eq!(state(&editor, &mut cx), expected, "after {key:?}");
+        assert_eq!(mode(&editor, &mut cx), Mode::Writing, "after {key:?}");
+    }
+}
+
+#[gpui::test]
+fn what_is_written_after_i_and_a_lands_at_the_caret(cx: &mut TestAppContext) {
+    let (editor, mut cx) = open("middle\n", cx);
+    cx.simulate_keystrokes("down i");
+    type_text("start ", &mut cx);
+    cx.simulate_keystrokes("escape a");
+    type_text(" end", &mut cx);
+    assert_eq!(saved(&editor, &mut cx), "start middle end\n");
+}
+
+#[gpui::test]
+fn i_and_a_do_nothing_with_nothing_selected(cx: &mut TestAppContext) {
+    let (editor, mut cx) = open(NESTED, cx);
+    cx.simulate_keystrokes("i a shift-i shift-a");
+    assert_eq!(mode(&editor, &mut cx), Mode::Idle);
+    assert_eq!(saved(&editor, &mut cx), NESTED);
+}
+
+#[gpui::test]
 fn vim_keys_are_text_while_writing(cx: &mut TestAppContext) {
     let (editor, mut cx) = open("", cx);
     cx.simulate_keystrokes("enter");
-    type_text("hjkl HJKL do DO", &mut cx);
-    assert_eq!(state(&editor, &mut cx), "p hjkl HJKL do DOˇ\n");
+    type_text("hjkl HJKL do DO ia IA", &mut cx);
+    assert_eq!(state(&editor, &mut cx), "p hjkl HJKL do DO ia IAˇ\n");
 }
 
 #[gpui::test]

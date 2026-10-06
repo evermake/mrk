@@ -1,7 +1,7 @@
 //! The scrollbar of the note. GPUI draws the whole window itself, so this is not the system's
-//! scrollbar but one that looks and behaves like it: a thumb over the right edge of the note,
-//! as long as the share of the note that is in view and placed where that part is. Dragging
-//! the thumb scrolls, and pressing the track beside it brings the thumb there.
+//! scrollbar but mrk's own: a plain bar over the right edge of the note, whose thumb is as
+//! long as the share of the note that is in view and placed where that part is. Dragging the
+//! thumb scrolls, and pressing the track above or below it brings the thumb there.
 
 use std::time::{Duration, Instant};
 
@@ -13,15 +13,11 @@ use gpui::{
 
 use crate::theme::Theme;
 
-// The scrollbar is sized in pixels, not zoomed: like the system's, it belongs to the window
-// rather than to the note.
-/// The strip along the right edge that reacts to the pointer.
-pub(crate) const TRACK_WIDTH: Pixels = px(15.);
-const THUMB_WIDTH: Pixels = px(7.);
-/// The thumb is wider while the pointer is on the track, which makes it easier to hold.
-const WIDE_THUMB_WIDTH: Pixels = px(11.);
-/// The gap between the thumb and the edges of the track.
-pub(crate) const THUMB_MARGIN: Pixels = px(2.);
+// The scrollbar is sized in pixels, not zoomed: it belongs to the window rather than to the
+// note.
+/// How wide the thumb is, and with it the track: the strip along the right edge that reacts
+/// to the pointer.
+pub(crate) const WIDTH: Pixels = px(10.);
 /// The thumb of a long note does not get shorter than this.
 const MIN_THUMB_LENGTH: Pixels = px(24.);
 /// How long the scrollbar stays after it was last used, where the system hides scrollbars.
@@ -207,8 +203,8 @@ impl Scrollbar {
             self.reveal(cx);
         }
         self.thumb = Thumb::new(
-            track.top() + THUMB_MARGIN,
-            track.size.height - THUMB_MARGIN * 2.,
+            track.top(),
+            track.size.height,
             self.scroll_handle.bounds().size.height,
             scrolled,
             self.scroll_handle.max_offset().y,
@@ -239,19 +235,10 @@ impl Scrollbar {
     }
 }
 
-/// The thumb as it is painted, along the right edge of `track`.
-fn thumb_bounds(thumb: &Thumb, track: Bounds<Pixels>, wide: bool) -> Bounds<Pixels> {
-    let width = if wide { WIDE_THUMB_WIDTH } else { THUMB_WIDTH };
-    Bounds::new(
-        point(track.right() - THUMB_MARGIN - width, thumb.top),
-        size(width, thumb.length),
-    )
-}
-
 impl Render for Scrollbar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_appearance(window.appearance());
-        let (thumb_color, track_color) = (theme.scrollbar_thumb, theme.scrollbar_track);
+        let (color, active_color) = (theme.scrollbar_thumb, theme.scrollbar_thumb_active);
         let scrollbar = cx.entity();
         canvas(
             {
@@ -270,18 +257,20 @@ impl Render for Scrollbar {
                     return;
                 };
                 let held = this.grip.is_some();
-                let wide = held || this.hovered;
+                // The thumb stands out while the pointer is on the scrollbar or holds it.
+                let color = if held || this.hovered {
+                    active_color
+                } else {
+                    color
+                };
                 let opacity = this.opacity(cx);
 
                 if opacity > 0. {
-                    if wide {
-                        window.paint_quad(fill(track, track_color.opacity(opacity)));
-                    }
-                    let thumb = thumb_bounds(&thumb, track, wide);
-                    window.paint_quad(
-                        fill(thumb, thumb_color.opacity(opacity))
-                            .corner_radii(thumb.size.width / 2.),
+                    let thumb = Bounds::new(
+                        point(track.left(), thumb.top),
+                        size(track.size.width, thumb.length),
                     );
+                    window.paint_quad(fill(thumb, color.opacity(opacity)));
                     if opacity < 1. {
                         window.request_animation_frame();
                     }
@@ -355,7 +344,7 @@ impl Render for Scrollbar {
         .top_0()
         .right_0()
         .bottom_0()
-        .w(TRACK_WIDTH)
+        .w(WIDTH)
     }
 }
 

@@ -7,7 +7,7 @@ use gpui::{
 use pretty_assertions::assert_eq;
 
 use super::*;
-use crate::scrollbar::{HIDE_DELAY, THUMB_MARGIN, TRACK_WIDTH};
+use crate::scrollbar::{HIDE_DELAY, WIDTH};
 
 /// A note several windows long.
 fn long_note() -> String {
@@ -28,7 +28,7 @@ fn thumb(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> Option<Range<Pi
 
 /// A point on the track of the scrollbar, `y` down the window.
 fn on_track(y: Pixels, editor: &Entity<Editor>, cx: &mut VisualTestContext) -> Point<Pixels> {
-    point(viewport(editor, cx).right() - TRACK_WIDTH / 2., y)
+    point(viewport(editor, cx).right() - WIDTH / 2., y)
 }
 
 /// How far the note is scrolled, and how far it can be.
@@ -85,7 +85,7 @@ fn only_a_note_longer_than_the_window_has_a_scrollbar(cx: &mut TestAppContext) {
 fn the_thumb_shows_which_part_of_the_note_is_in_view(cx: &mut TestAppContext) {
     let (editor, mut cx) = open(&long_note(), cx);
     let viewport = viewport(&editor, &mut cx);
-    let track = viewport.top() + THUMB_MARGIN..viewport.bottom() - THUMB_MARGIN;
+    let track = viewport.top()..viewport.bottom();
     let (_, scrollable) = scrolled(&editor, &mut cx);
 
     // Its length is to the track what the part in view is to the note.
@@ -118,7 +118,7 @@ fn dragging_the_thumb_scrolls_the_note(cx: &mut TestAppContext) {
     let at_start = thumb(&editor, &mut cx).unwrap();
     let (_, scrollable) = scrolled(&editor, &mut cx);
     // How far the thumb moves to scroll through the whole note.
-    let travel = viewport.size.height - THUMB_MARGIN * 2. - (at_start.end - at_start.start);
+    let travel = viewport.size.height - (at_start.end - at_start.start);
 
     let held = on_track(at_start.start + px(5.), &editor, &mut cx);
     cx.simulate_mouse_move(held, None, Modifiers::none());
@@ -181,7 +181,7 @@ fn pressing_the_track_brings_the_thumb_there(cx: &mut TestAppContext) {
 
     // The note under the scrollbar was not clicked, as it is beside it.
     assert_eq!(mode(&editor, &mut cx), Mode::Idle);
-    cx.simulate_click(top - point(TRACK_WIDTH, px(0.)), Modifiers::none());
+    cx.simulate_click(top - point(WIDTH, px(0.)), Modifiers::none());
     assert_eq!(mode(&editor, &mut cx), Mode::Writing);
 }
 
@@ -282,7 +282,7 @@ fn the_scrollbar_hides_while_unused_where_the_system_hides_scrollbars(cx: &mut T
     // The pointer leaving the window from the scrollbar counts as leaving the scrollbar.
     cx.simulate_mouse_move(on_it, None, Modifiers::none());
     cx.simulate_event(MouseExitEvent {
-        position: on_it + point(TRACK_WIDTH, px(0.)),
+        position: on_it + point(WIDTH, px(0.)),
         pressed_button: None,
         modifiers: Modifiers::none(),
     });

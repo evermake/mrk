@@ -5,6 +5,7 @@ use super::*;
 
 mod selection_across_blocks;
 mod typing_shortcuts;
+mod word_selection;
 
 /// Opens a window showing an editor for `source` and focuses it.
 fn open(source: &str, cx: &mut TestAppContext) -> (Entity<Editor>, VisualTestContext) {

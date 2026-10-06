@@ -14,6 +14,11 @@ pub struct Theme {
     pub text_selection: Hsla,
     pub block_selection: Hsla,
     pub code_background: Hsla,
+    /// What the thumb of the scrollbar moves in, just told apart from the background.
+    pub scrollbar_track: Hsla,
+    pub scrollbar_thumb: Hsla,
+    /// The thumb while the pointer is on the scrollbar or holds it.
+    pub scrollbar_thumb_active: Hsla,
 }
 
 impl Theme {
@@ -30,6 +35,9 @@ impl Theme {
                 text_selection: rgba(0x5b9dff59).into(),
                 block_selection: rgba(0x5b9dff2e).into(),
                 code_background: rgb(0x26282c).into(),
+                scrollbar_track: rgba(0xffffff12).into(),
+                scrollbar_thumb: rgba(0xffffff40).into(),
+                scrollbar_thumb_active: rgba(0xffffff73).into(),
             },
             WindowAppearance::Light | WindowAppearance::VibrantLight => Self {
                 background: rgb(0xffffff).into(),
@@ -42,6 +50,9 @@ impl Theme {
                 text_selection: rgba(0x2f6feb40).into(),
                 block_selection: rgba(0x2f6feb1f).into(),
                 code_background: rgb(0xf3f4f6).into(),
+                scrollbar_track: rgba(0x0000000f).into(),
+                scrollbar_thumb: rgba(0x00000033).into(),
+                scrollbar_thumb_active: rgba(0x00000066).into(),
             },
         }
     }

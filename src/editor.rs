@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, Bounds, ClipboardItem, Context, EntityInputHandler, FocusHandle, Focusable,
-    Font, FontStyle, FontWeight, KeyBinding, KeyContext, MouseButton, MouseDownEvent,
+    AnyElement, App, Bounds, ClipboardItem, Context, Entity, EntityInputHandler, FocusHandle,
+    Focusable, Font, FontStyle, FontWeight, KeyBinding, KeyContext, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Pixels, Point, Rems, ScrollHandle, SharedString,
     StrikethroughStyle, StyledText, Task, TextRun, UTF16Selection, UnderlineStyle, Window, canvas,
     div, fill, point, prelude::*, px,
@@ -19,6 +19,7 @@ use crate::block_text::{BlockLayout, BlockText, Caret, LayoutMap};
 use crate::document::{Block, BlockId, BlockKind, Document, Row, TextPosition};
 use crate::markdown;
 use crate::rich_text::{InlineStyle, Mark, RichText};
+use crate::scrollbar::Scrollbar;
 use crate::theme::{MONO_FONT, Theme, UI_FONT};
 use crate::zoom::zoomed;
 
@@ -294,6 +295,7 @@ pub struct Editor {
     last_revision: u64,
     layouts: LayoutMap,
     scroll_handle: ScrollHandle,
+    scrollbar: Entity<Scrollbar>,
     focus_handle: FocusHandle,
     needs_autoscroll: bool,
     drag: Option<Drag>,
@@ -309,6 +311,7 @@ impl Focusable for Editor {
 
 impl Editor {
     pub fn new(document: Document, cx: &mut Context<Self>) -> Self {
+        let scroll_handle = ScrollHandle::new();
         Self {
             document,
             selection: Selection::None,
@@ -321,7 +324,8 @@ impl Editor {
             saved_revision: 0,
             last_revision: 0,
             layouts: Rc::new(RefCell::new(HashMap::new())),
-            scroll_handle: ScrollHandle::new(),
+            scrollbar: cx.new(|_| Scrollbar::new(scroll_handle.clone())),
+            scroll_handle,
             focus_handle: cx.focus_handle(),
             needs_autoscroll: false,
             drag: None,
@@ -2392,24 +2396,31 @@ impl Render for Editor {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
             .child(
                 div()
-                    .id("document")
+                    .relative()
                     .flex_1()
                     .min_h_0()
                     .w_full()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll_handle)
                     .child(
                         div()
-                            .mx_auto()
-                            .w_full()
-                            .max_w(CONTENT_WIDTH)
-                            .px(zoomed(24.))
-                            .pt(zoomed(32.))
-                            .pb(zoomed(160.))
-                            .flex()
-                            .flex_col()
-                            .children(elements),
-                    ),
+                            .id("document")
+                            .size_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.scroll_handle)
+                            .child(
+                                div()
+                                    .mx_auto()
+                                    .w_full()
+                                    .max_w(CONTENT_WIDTH)
+                                    .px(zoomed(24.))
+                                    .pt(zoomed(32.))
+                                    .pb(zoomed(160.))
+                                    .flex()
+                                    .flex_col()
+                                    .children(elements),
+                            ),
+                    )
+                    // Over the note, and after it: it is drawn from how the note was laid out.
+                    .child(self.scrollbar.clone()),
             )
             .child(
                 div()

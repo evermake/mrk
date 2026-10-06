@@ -897,7 +897,8 @@ fn clicking_a_checkbox_toggles_it(cx: &mut TestAppContext) {
     let text = editor.read_with(&cx, |editor, _| {
         editor.layouts.borrow()[&editor.document.first()].bounds
     });
-    let checkbox = point(text.left() - INDENT + px(7.), text.center().y);
+    let indent = cx.update(|window, _| INDENT.to_pixels(window.rem_size()));
+    let checkbox = point(text.left() - indent + px(7.), text.center().y);
     cx.simulate_click(checkbox, gpui::Modifiers::none());
     assert_eq!(state(&editor, &mut cx), "[x] task\n");
     assert_eq!(mode(&editor, &mut cx), Mode::Idle);
@@ -934,4 +935,74 @@ fn the_selection_is_scrolled_into_view(cx: &mut TestAppContext) {
         is_visible(&mut cx),
         "the first block should be scrolled back to"
     );
+}
+
+#[gpui::test]
+fn everything_is_sized_by_the_rem_size(cx: &mut TestAppContext) {
+    let (editor, mut cx) = open("# title\n\nparagraph\n\n- bullet\n", cx);
+    let measure = |cx: &mut VisualTestContext| {
+        editor.read_with(cx, |editor, _| {
+            let ids: Vec<_> = editor
+                .document
+                .rows()
+                .iter()
+                .map(|row| row.block.id)
+                .collect();
+            let layouts = editor.layouts.borrow();
+            let heading = layouts[&ids[0]].bounds;
+            let paragraph = layouts[&ids[1]].bounds;
+            let bullet = layouts[&ids[2]].bounds;
+            // The heading and a line of text, and how far a bullet is indented.
+            (
+                heading.size.height,
+                paragraph.size.height,
+                bullet.left() - paragraph.left(),
+            )
+        })
+    };
+    let (heading, paragraph, indent) = measure(&mut cx);
+    assert_eq!((heading, paragraph, indent), (px(36.), px(24.), px(24.)));
+
+    cx.update(|window, _| window.set_rem_size(px(32.)));
+    cx.simulate_keystrokes("down");
+    let (heading, paragraph, indent) = measure(&mut cx);
+    assert_eq!((heading, paragraph, indent), (px(72.), px(48.), px(48.)));
+}
+
+#[gpui::test]
+fn rescaling_keeps_the_scrolled_part_in_view(cx: &mut TestAppContext) {
+    let source: String = (0..200)
+        .map(|index| format!("paragraph {index}\n\n"))
+        .collect();
+    let (editor, mut cx) = open(&source, cx);
+    let first_visible = |cx: &mut VisualTestContext| {
+        editor.read_with(cx, |editor, _| {
+            let viewport = editor.scroll_handle.bounds();
+            let layouts = editor.layouts.borrow();
+            editor
+                .document
+                .rows()
+                .iter()
+                .position(|row| layouts[&row.block.id].bounds.bottom() > viewport.top())
+        })
+    };
+    editor.update(&mut cx, |editor, cx| {
+        let mut offset = editor.scroll_handle.offset();
+        offset.y = px(-2000.);
+        editor.scroll_handle.set_offset(offset);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let before = first_visible(&mut cx).unwrap();
+    assert!(before > 10, "the note should have been scrolled");
+
+    cx.update(|window, _| window.set_rem_size(px(32.)));
+    editor.update(&mut cx, |editor, cx| editor.rescale_scroll(2., cx));
+    cx.run_until_parked();
+    assert_eq!(first_visible(&mut cx), Some(before));
+
+    cx.update(|window, _| window.set_rem_size(px(8.)));
+    editor.update(&mut cx, |editor, cx| editor.rescale_scroll(0.25, cx));
+    cx.run_until_parked();
+    assert_eq!(first_visible(&mut cx), Some(before));
 }

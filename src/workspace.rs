@@ -4,14 +4,28 @@ use anyhow::{Context as _, Result};
 use gpui::{
     AnyElement, App, Context, Entity, FocusHandle, Focusable, KeyBinding, MouseButton,
     PathPromptOptions, PromptLevel, SharedString, Subscription, Task, Window, actions, div,
-    prelude::*, px,
+    prelude::*,
 };
 
 use crate::editor::Editor;
 use crate::markdown;
 use crate::theme::Theme;
+use crate::zoom::{Zoom, zoomed};
 
-actions!(mrk, [NewFile, OpenFile, Save, SaveAs, CloseWindow, Quit]);
+actions!(
+    mrk,
+    [
+        NewFile,
+        OpenFile,
+        Save,
+        SaveAs,
+        CloseWindow,
+        Quit,
+        ZoomIn,
+        ZoomOut,
+        ResetZoom
+    ]
+);
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -21,6 +35,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-s", SaveAs, None),
         KeyBinding::new("cmd-w", CloseWindow, None),
         KeyBinding::new("cmd-q", Quit, None),
+        // `+` is `Shift+=` on most keyboards, so either key zooms in.
+        KeyBinding::new("cmd-+", ZoomIn, None),
+        KeyBinding::new("cmd-=", ZoomIn, None),
+        KeyBinding::new("cmd--", ZoomOut, None),
+        KeyBinding::new("cmd-0", ResetZoom, None),
     ]);
 }
 
@@ -30,6 +49,7 @@ const UNTITLED: &str = "Untitled";
 pub struct Workspace {
     focus_handle: FocusHandle,
     note: Option<Note>,
+    zoom: Zoom,
     /// The title and edited state last given to the window, to only update it on change.
     window_title: Option<(String, bool)>,
     _appearance_observation: Subscription,
@@ -62,6 +82,7 @@ impl Workspace {
         Self {
             focus_handle,
             note: None,
+            zoom: Zoom::default(),
             window_title: None,
             // The colors follow the system's light or dark appearance.
             _appearance_observation: cx.observe_window_appearance(window, |this, _, cx| {
@@ -342,6 +363,33 @@ impl Workspace {
         .detach_and_log_err(cx);
     }
 
+    /// Zooms to `zoom`, keeping the part of the note that is in view roughly where it was.
+    fn set_zoom(&mut self, zoom: Zoom, window: &mut Window, cx: &mut Context<Self>) {
+        if zoom == self.zoom {
+            return;
+        }
+        let ratio = zoom.factor() / self.zoom.factor();
+        self.zoom = zoom;
+        window.set_rem_size(zoom.rem_size());
+        if let Some(note) = &self.note {
+            note.editor
+                .update(cx, |editor, cx| editor.rescale_scroll(ratio, cx));
+        }
+        cx.notify();
+    }
+
+    fn zoom_in(&mut self, _: &ZoomIn, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_zoom(self.zoom.zoom_in(), window, cx);
+    }
+
+    fn zoom_out(&mut self, _: &ZoomOut, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_zoom(self.zoom.zoom_out(), window, cx);
+    }
+
+    fn reset_zoom(&mut self, _: &ResetZoom, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_zoom(Zoom::default(), window, cx);
+    }
+
     fn render_welcome(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let button = |label: &'static str, shortcut: &'static str| {
             div()
@@ -349,10 +397,10 @@ impl Workspace {
                 .flex()
                 .flex_row()
                 .justify_between()
-                .gap(px(32.))
-                .px(px(12.))
-                .py(px(6.))
-                .rounded(px(6.))
+                .gap(zoomed(32.))
+                .px(zoomed(12.))
+                .py(zoomed(6.))
+                .rounded(zoomed(6.))
                 .border_1()
                 .border_color(theme.faint)
                 .cursor_pointer()
@@ -366,22 +414,22 @@ impl Workspace {
             .flex_col()
             .items_center()
             .justify_center()
-            .gap(px(8.))
+            .gap(zoomed(8.))
             .bg(theme.background)
             .text_color(theme.text)
-            .text_size(px(14.))
-            .child(div().text_size(px(28.)).child("mrk"))
+            .text_size(zoomed(14.))
+            .child(div().text_size(zoomed(28.)).child("mrk"))
             .child(
                 div()
-                    .mb(px(12.))
+                    .mb(zoomed(12.))
                     .text_color(theme.muted)
                     .child("Open a Markdown file to start."),
             )
-            .child(button("Open…", "⌘O").w(px(220.)).on_mouse_down(
+            .child(button("Open…", "⌘O").w(zoomed(220.)).on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| this.open_file(&OpenFile, window, cx)),
             ))
-            .child(button("New note", "⌘N").w(px(220.)).on_mouse_down(
+            .child(button("New note", "⌘N").w(zoomed(220.)).on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| this.new_file(&NewFile, window, cx)),
             ))
@@ -408,6 +456,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::save_as))
             .on_action(cx.listener(Self::close_window))
             .on_action(cx.listener(Self::quit))
+            .on_action(cx.listener(Self::zoom_in))
+            .on_action(cx.listener(Self::zoom_out))
+            .on_action(cx.listener(Self::reset_zoom))
             .child(match &self.note {
                 Some(note) => note.editor.clone().into_any_element(),
                 None => self.render_welcome(&theme, cx),
@@ -514,6 +565,10 @@ mod tests {
             workspace.open_path(path.to_path_buf(), window, cx)
         });
         cx.run_until_parked();
+    }
+
+    fn zoom_percent(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> u32 {
+        workspace.read_with(cx, |workspace, _| workspace.zoom.percent())
     }
 
     fn files_in(directory: &Path) -> Vec<String> {
@@ -645,6 +700,93 @@ mod tests {
         assert!(cx.has_pending_prompt());
         cx.simulate_prompt_answer("OK");
         assert!(workspace.read_with(&cx, |workspace, _| workspace.note.is_none()));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[gpui::test]
+    fn the_zoom_keys_resize_the_window(cx: &mut TestAppContext) {
+        let (workspace, mut cx) = open_workspace(cx);
+        let rem_size = |cx: &mut VisualTestContext| cx.update(|window, _| window.rem_size());
+        assert_eq!(zoom_percent(&workspace, &mut cx), 100);
+        assert_eq!(rem_size(&mut cx), gpui::px(16.));
+
+        for (keystroke, percent) in [
+            ("cmd-+", 110),
+            ("cmd-=", 125),
+            ("cmd--", 110),
+            ("cmd--", 100),
+            ("cmd--", 90),
+            ("cmd-0", 100),
+            ("cmd-+", 110),
+            ("cmd-0", 100),
+        ] {
+            cx.simulate_keystrokes(keystroke);
+            assert_eq!(zoom_percent(&workspace, &mut cx), percent, "{keystroke}");
+            let zoom = workspace.read_with(&cx, |workspace, _| workspace.zoom);
+            assert_eq!(rem_size(&mut cx), zoom.rem_size(), "{keystroke}");
+        }
+    }
+
+    #[gpui::test]
+    fn zooming_stops_at_the_smallest_and_the_largest_size(cx: &mut TestAppContext) {
+        let (workspace, mut cx) = open_workspace(cx);
+        for _ in 0..30 {
+            cx.simulate_keystrokes("cmd-+");
+        }
+        assert_eq!(zoom_percent(&workspace, &mut cx), 300);
+        cx.simulate_keystrokes("cmd-0");
+        for _ in 0..30 {
+            cx.simulate_keystrokes("cmd--");
+        }
+        assert_eq!(zoom_percent(&workspace, &mut cx), 50);
+    }
+
+    #[gpui::test]
+    fn zooming_while_writing_does_not_type(cx: &mut TestAppContext) {
+        let directory = temporary_directory("zoom-writing");
+        let path = directory.join("note.md");
+        std::fs::write(&path, "text\n").unwrap();
+        let (workspace, mut cx) = open_workspace(cx);
+        open_file(&path, &workspace, &mut cx);
+
+        cx.simulate_keystrokes("down enter cmd-+ cmd-= cmd-- cmd-0 cmd-+");
+        assert_eq!(zoom_percent(&workspace, &mut cx), 110);
+        assert!(!workspace.read_with(&cx, |workspace, cx| workspace.is_dirty(cx)));
+        cx.simulate_keystrokes("cmd-s");
+        cx.run_until_parked();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "text\n");
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[gpui::test]
+    fn zooming_keeps_the_scrolled_part_of_the_note_in_view(cx: &mut TestAppContext) {
+        let directory = temporary_directory("zoom-scroll");
+        let path = directory.join("note.md");
+        let source: String = (0..200).map(|index| format!("line {index}\n\n")).collect();
+        std::fs::write(&path, source).unwrap();
+        let (workspace, mut cx) = open_workspace(cx);
+        open_file(&path, &workspace, &mut cx);
+        let scrolled = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| {
+                let note = workspace.note.as_ref().unwrap();
+                note.editor.read(cx).scroll_offset().y
+            })
+        };
+
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: gpui::point(gpui::px(400.), gpui::px(300.)),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-1000.))),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+        assert_eq!(scrolled(&mut cx), gpui::px(-1000.));
+
+        cx.simulate_keystrokes("cmd-= cmd-=");
+        let zoomed = workspace.read_with(&cx, |workspace, _| workspace.zoom.factor());
+        assert_eq!(zoomed, 1.25);
+        assert_eq!(scrolled(&mut cx), gpui::px(-1250.));
+        cx.simulate_keystrokes("cmd-0");
+        assert_eq!(scrolled(&mut cx), gpui::px(-1000.));
         std::fs::remove_dir_all(&directory).unwrap();
     }
 

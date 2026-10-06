@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 use gpui::{
     AnyElement, App, Bounds, ClipboardItem, Context, EntityInputHandler, FocusHandle, Focusable,
     Font, FontStyle, FontWeight, KeyBinding, KeyContext, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollHandle, SharedString, StrikethroughStyle,
-    StyledText, Task, TextRun, UTF16Selection, UnderlineStyle, Window, canvas, div, fill, point,
-    prelude::*, px,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, Rems, ScrollHandle, SharedString,
+    StrikethroughStyle, StyledText, Task, TextRun, UTF16Selection, UnderlineStyle, Window, canvas,
+    div, fill, point, prelude::*, px,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -20,6 +20,7 @@ use crate::document::{Block, BlockId, BlockKind, Document, Row, TextPosition};
 use crate::markdown;
 use crate::rich_text::{InlineStyle, Mark, RichText};
 use crate::theme::{MONO_FONT, Theme, UI_FONT};
+use crate::zoom::zoomed;
 
 #[cfg(test)]
 mod tests;
@@ -152,8 +153,8 @@ pub fn bind_keys(cx: &mut App) {
     ]);
 }
 
-const INDENT: Pixels = px(24.);
-const CONTENT_WIDTH: Pixels = px(760.);
+const INDENT: Rems = zoomed(24.);
+const CONTENT_WIDTH: Rems = zoomed(760.);
 const SCROLL_MARGIN: Pixels = px(24.);
 const CODE_INDENT: &str = "    ";
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
@@ -307,6 +308,19 @@ impl Editor {
             caret_visible: true,
             blink_task: None,
         }
+    }
+
+    /// Keeps the same part of the note in view after everything was scaled by `ratio`.
+    pub fn rescale_scroll(&mut self, ratio: f32, cx: &mut Context<Self>) {
+        let mut offset = self.scroll_handle.offset();
+        offset.y *= ratio;
+        self.scroll_handle.set_offset(offset);
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scroll_offset(&self) -> Point<Pixels> {
+        self.scroll_handle.offset()
     }
 
     pub fn document(&self) -> &Document {
@@ -1973,7 +1987,7 @@ impl Editor {
                 .w(INDENT)
                 .flex_none()
                 .flex()
-                .child(div().w(px(3.)).bg(theme.faint))
+                .child(div().w(zoomed(3.)).bg(theme.faint))
         };
 
         let marker = match &block.kind {
@@ -1984,14 +1998,20 @@ impl Editor {
                     .h(metrics.line_height)
                     .flex()
                     .items_center()
-                    .child(div().ml(px(5.)).size(px(5.)).rounded_full().bg(theme.muted))
+                    .child(
+                        div()
+                            .ml(zoomed(5.))
+                            .size(zoomed(5.))
+                            .rounded_full()
+                            .bg(theme.muted),
+                    )
                     .into_any_element(),
             ),
             BlockKind::Numbered => Some(
                 div()
                     .min_w(INDENT)
                     .flex_none()
-                    .pr(px(6.))
+                    .pr(zoomed(6.))
                     .text_color(theme.muted)
                     .child(format!("{}.", row.ordinal))
                     .into_any_element(),
@@ -2008,15 +2028,15 @@ impl Editor {
                         .child(
                             div()
                                 .id(("todo", id as usize))
-                                .size(px(15.))
-                                .rounded(px(3.))
+                                .size(zoomed(15.))
+                                .rounded(zoomed(3.))
                                 .border_1()
                                 .border_color(if checked { theme.accent } else { theme.muted })
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .text_size(px(11.))
-                                .line_height(px(13.))
+                                .text_size(zoomed(11.))
+                                .line_height(zoomed(13.))
                                 .text_color(theme.background)
                                 .when(checked, |checkbox| checkbox.bg(theme.accent).child("✓"))
                                 .cursor_pointer()
@@ -2034,74 +2054,76 @@ impl Editor {
             _ => None,
         };
 
-        let content =
-            match &block.kind {
-                BlockKind::Divider => {
-                    let layouts = self.layouts.clone();
-                    let color = theme.faint;
-                    div()
-                        .flex_1()
-                        .h(px(25.))
-                        .child(
-                            canvas(
-                                |_, _, _| {},
-                                move |bounds, _, window, _| {
-                                    let line = Bounds::new(
-                                        point(bounds.left(), bounds.center().y),
-                                        gpui::size(bounds.size.width, px(1.)),
-                                    );
-                                    window.paint_quad(fill(line, color));
-                                    layouts
-                                        .borrow_mut()
-                                        .insert(id, BlockLayout::without_text(bounds));
-                                },
-                            )
-                            .size_full(),
+        let content = match &block.kind {
+            BlockKind::Divider => {
+                let layouts = self.layouts.clone();
+                let color = theme.faint;
+                div()
+                    .flex_1()
+                    .h(zoomed(25.))
+                    .child(
+                        canvas(
+                            |_, _, _| {},
+                            move |bounds, _, window, _| {
+                                let thickness = zoomed(1.).to_pixels(window.rem_size()).max(px(1.));
+                                let line = Bounds::new(
+                                    point(bounds.left(), bounds.center().y),
+                                    gpui::size(bounds.size.width, thickness),
+                                );
+                                window.paint_quad(fill(line, color));
+                                layouts
+                                    .borrow_mut()
+                                    .insert(id, BlockLayout::without_text(bounds));
+                            },
                         )
-                        .into_any_element()
-                }
-                BlockKind::Code { .. } | BlockKind::Raw => {
-                    let label = match &block.kind {
-                        BlockKind::Code { language } => language.clone(),
-                        _ => "markdown".to_string(),
-                    };
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .px(px(12.))
-                        .py(px(8.))
-                        .rounded(px(6.))
-                        .bg(theme.code_background)
-                        .when(!label.is_empty(), |code| {
-                            code.child(
-                                div()
-                                    .text_size(px(11.))
-                                    .line_height(px(16.))
-                                    .text_color(theme.muted)
-                                    .child(label),
-                            )
-                        })
-                        .child(div().cursor_text().child(
-                            self.render_block_text(block, theme, is_focused, span_range, cx),
-                        ))
-                        .into_any_element()
-                }
-                _ => div()
+                        .size_full(),
+                    )
+                    .into_any_element()
+            }
+            BlockKind::Code { .. } | BlockKind::Raw => {
+                let label = match &block.kind {
+                    BlockKind::Code { language } => language.clone(),
+                    _ => "markdown".to_string(),
+                };
+                div()
                     .flex_1()
                     .min_w_0()
-                    .cursor_text()
-                    .child(self.render_block_text(block, theme, is_focused, span_range, cx))
-                    .into_any_element(),
-            };
+                    .px(zoomed(12.))
+                    .py(zoomed(8.))
+                    .rounded(zoomed(6.))
+                    .bg(theme.code_background)
+                    .when(!label.is_empty(), |code| {
+                        code.child(
+                            div()
+                                .text_size(zoomed(11.))
+                                .line_height(zoomed(16.))
+                                .text_color(theme.muted)
+                                .child(label),
+                        )
+                    })
+                    .child(
+                        div().cursor_text().child(
+                            self.render_block_text(block, theme, is_focused, span_range, cx),
+                        ),
+                    )
+                    .into_any_element()
+            }
+            _ => div()
+                .flex_1()
+                .min_w_0()
+                .cursor_text()
+                .child(self.render_block_text(block, theme, is_focused, span_range, cx))
+                .into_any_element(),
+        };
 
         div()
             .w_full()
             .flex()
             .flex_row()
-            .px(px(8.))
+            .px(zoomed(8.))
             .when(highlight.selected, |row| row.bg(theme.block_selection))
-            .when(highlight.first, |row| row.rounded_t(px(4.)))
-            .when(highlight.last, |row| row.rounded_b(px(4.)))
+            .when(highlight.first, |row| row.rounded_t(zoomed(4.)))
+            .when(highlight.last, |row| row.rounded_b(zoomed(4.)))
             .children(row.quote_ancestors.iter().map(|is_quote| {
                 if *is_quote {
                     quote_bar().into_any_element()
@@ -2139,10 +2161,10 @@ struct RowHighlight {
 
 /// Font size and spacing of a block type.
 struct BlockMetrics {
-    font_size: Pixels,
-    line_height: Pixels,
-    padding_top: Pixels,
-    padding_bottom: Pixels,
+    font_size: Rems,
+    line_height: Rems,
+    padding_top: Rems,
+    padding_bottom: Rems,
 }
 
 impl BlockMetrics {
@@ -2158,10 +2180,10 @@ impl BlockMetrics {
             _ => (15., 24., 4., 4.),
         };
         Self {
-            font_size: px(font_size),
-            line_height: px(line_height),
-            padding_top: px(padding_top),
-            padding_bottom: px(padding_bottom),
+            font_size: zoomed(font_size),
+            line_height: zoomed(line_height),
+            padding_top: zoomed(padding_top),
+            padding_bottom: zoomed(padding_bottom),
         }
     }
 }
@@ -2291,9 +2313,9 @@ impl Render for Editor {
                             .mx_auto()
                             .w_full()
                             .max_w(CONTENT_WIDTH)
-                            .px(px(24.))
-                            .pt(px(32.))
-                            .pb(px(160.))
+                            .px(zoomed(24.))
+                            .pt(zoomed(32.))
+                            .pb(zoomed(160.))
                             .flex()
                             .flex_col()
                             .children(elements),
@@ -2302,11 +2324,11 @@ impl Render for Editor {
             .child(
                 div()
                     .flex_none()
-                    .h(px(24.))
-                    .px(px(12.))
+                    .h(zoomed(24.))
+                    .px(zoomed(12.))
                     .flex()
                     .items_center()
-                    .text_size(px(11.))
+                    .text_size(zoomed(11.))
                     .text_color(theme.muted)
                     .child(mode),
             )

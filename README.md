@@ -135,6 +135,12 @@ Typing a marker at the start of a paragraph, followed by a space, converts the b
   the other marks apply to the selected text of every block. `Esc` selects the blocks it
   reaches into, and `Tab` / `Shift+Tab` and `Alt+Up` / `Alt+Down` move them.
 
+### Zoom
+
+`Cmd++` (or `Cmd+=`) zooms the whole window in, `Cmd+-` out and `Cmd+0` goes back to the
+actual size, as in a browser. The steps run from 50% to 300%, and the part of the note in view
+stays in view. The same commands are in the View menu.
+
 ### Files
 
 - `Cmd+O` open, `Cmd+N` new, `Cmd+S` save, `Cmd+Shift+S` save as.
@@ -151,6 +157,7 @@ Typing a marker at the start of a paragraph, followed by a space, converts the b
   unnoticeable for ordinary notes but measured about 28 ms per keystroke on a 3,000-block
   document.
 - Reloading when the file changes on disk.
+- Remembering the zoom between launches.
 
 ## Development
 

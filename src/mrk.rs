@@ -5,3 +5,4 @@ pub mod markdown;
 pub mod rich_text;
 pub mod theme;
 pub mod workspace;
+pub mod zoom;

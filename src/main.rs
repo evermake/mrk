@@ -6,7 +6,9 @@ use gpui::{
 };
 
 use mrk::editor::{self, actions as edit};
-use mrk::workspace::{self, CloseWindow, NewFile, OpenFile, Quit, Save, SaveAs, Workspace};
+use mrk::workspace::{
+    self, CloseWindow, NewFile, OpenFile, Quit, ResetZoom, Save, SaveAs, Workspace, ZoomIn, ZoomOut,
+};
 
 fn main() {
     // A file can be given on the command line; otherwise the file picker opens on launch.
@@ -81,6 +83,11 @@ fn menus() -> Vec<Menu> {
             MenuItem::action("Italic", edit::ToggleItalic),
             MenuItem::action("Strikethrough", edit::ToggleStrikethrough),
             MenuItem::action("Code", edit::ToggleCode),
+        ]),
+        Menu::new("View").items([
+            MenuItem::action("Actual Size", ResetZoom),
+            MenuItem::action("Zoom In", ZoomIn),
+            MenuItem::action("Zoom Out", ZoomOut),
         ]),
     ]
 }

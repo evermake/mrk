@@ -3,6 +3,7 @@ use pretty_assertions::assert_eq;
 
 use super::*;
 
+mod selection_across_blocks;
 mod typing_shortcuts;
 
 /// Opens a window showing an editor for `source` and focuses it.
@@ -23,13 +24,15 @@ fn open(source: &str, cx: &mut TestAppContext) -> (Entity<Editor>, VisualTestCon
 }
 
 /// The document as an outline, annotated with the selection: `ˇ` is the caret and `«»`
-/// surround selected text in writing mode, while `*` marks selected rows in navigation mode.
+/// surround selected text in writing mode, even when it runs across blocks, while `*` marks
+/// selected rows in navigation mode.
 fn state(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> String {
     editor.read_with(cx, |editor, _| {
         let selected_blocks = match &editor.selection {
             Selection::Blocks { anchor, head } => editor.document.subtree_ids(*anchor, *head),
             _ => HashSet::new(),
         };
+        let span = editor.span();
         let mut output = String::new();
         for row in editor.document.rows() {
             let block = row.block;
@@ -47,6 +50,16 @@ fn state(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> String {
                         .unwrap_or_default();
                     text.insert(selection.range.end, "»", style.clone());
                     text.insert(selection.range.start, "«", style);
+                }
+            }
+            if let Some((start, end)) = span {
+                if end.block == block.id {
+                    let style = text.typing_style(end.offset);
+                    text.insert(end.offset, "»", style);
+                }
+                if start.block == block.id {
+                    let style = text.typing_style(start.offset);
+                    text.insert(start.offset, "«", style);
                 }
             }
             if editor.mode() == Mode::Navigation {
@@ -514,8 +527,10 @@ fn the_caret_moves_between_lines_of_one_block(cx: &mut TestAppContext) {
     assert_eq!(state(&editor, &mut cx), "p oneˇ⏎two⏎three\np next\n");
     cx.simulate_keystrokes("down down down");
     assert_eq!(state(&editor, &mut cx), "p one⏎two⏎three\np nextˇ\n");
+    // The first row of `next` is followed by the last row of the block above, at the column
+    // the caret has kept since `three`: the selection runs across the blocks.
     cx.simulate_keystrokes("shift-up");
-    assert_eq!(state(&editor, &mut cx), "p one⏎two⏎three\np «next»\n");
+    assert_eq!(state(&editor, &mut cx), "p one⏎two⏎three«\np next»\n");
 }
 
 #[gpui::test]

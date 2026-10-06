@@ -126,7 +126,14 @@ Typing a marker at the start of a paragraph, followed by a space, converts the b
 - `Tab` / `Shift+Tab` and `Alt+Up` / `Alt+Down` act on the block being written in.
 - `Cmd+E` toggles inline code and `Cmd+Shift+X` strikethrough.
 - `Cmd`-click opens a link.
-- A text selection stays within one block.
+- A text selection can run across blocks. `Shift` + arrows (and `Shift`-click or dragging
+  the mouse) extend it past the edge of a block into the next one, and `Cmd+A` selects the
+  text of the block, then of the whole note. Typing, `Enter`, `Backspace`/`Delete` and paste
+  replace it: what is left of the last block joins the first one, which keeps its type
+  (code is not mixed with text, so those stay two blocks). `Cmd+C` copies the blocks it
+  reaches into as Markdown, cut to the selection, and `Cmd+X` also deletes it. `Cmd+B` and
+  the other marks apply to the selected text of every block. `Esc` selects the blocks it
+  reaches into, and `Tab` / `Shift+Tab` and `Alt+Up` / `Alt+Down` move them.
 
 ### Files
 
@@ -139,7 +146,6 @@ Typing a marker at the start of a paragraph, followed by a space, converts the b
 ## Not done yet
 
 - Slash menu for block types.
-- Text selection across blocks.
 - Inline Markdown shortcuts while typing (`**bold**`).
 - Rendering only the visible blocks. Every block is laid out on each frame, which is
   unnoticeable for ordinary notes but measured about 28 ms per keystroke on a 3,000-block

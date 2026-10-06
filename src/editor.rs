@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
@@ -15,7 +16,7 @@ use gpui::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::block_text::{BlockLayout, BlockText, Caret, LayoutMap};
-use crate::document::{Block, BlockId, BlockKind, Document, Row};
+use crate::document::{Block, BlockId, BlockKind, Document, Row, TextPosition};
 use crate::markdown;
 use crate::rich_text::{InlineStyle, Mark, RichText};
 use crate::theme::{MONO_FONT, Theme, UI_FONT};
@@ -178,6 +179,13 @@ pub enum Selection {
         head: BlockId,
     },
     Text(TextSelection),
+    /// Text selected across blocks, from `anchor` to `head`, which are in different blocks;
+    /// either may come first in the document. A selection within one block is a
+    /// [`Selection::Text`].
+    Span {
+        anchor: TextPosition,
+        head: TextPosition,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -210,15 +218,6 @@ impl TextSelection {
             self.range.end
         } else {
             self.range.start
-        }
-    }
-
-    fn with_head(&self, head: usize) -> Self {
-        let tail = self.tail();
-        Self {
-            block: self.block,
-            range: tail.min(head)..tail.max(head),
-            reversed: head < tail,
         }
     }
 }
@@ -334,10 +333,11 @@ impl Editor {
         match self.selection {
             Selection::None => Mode::Idle,
             Selection::Blocks { .. } => Mode::Navigation,
-            Selection::Text(_) => Mode::Writing,
+            Selection::Text(_) | Selection::Span { .. } => Mode::Writing,
         }
     }
 
+    /// The selected text when it is within one block.
     fn text_selection(&self) -> Option<&TextSelection> {
         match &self.selection {
             Selection::Text(selection) => Some(selection),
@@ -345,18 +345,67 @@ impl Editor {
         }
     }
 
-    /// The siblings the current selection acts on as blocks: the selected blocks, or the
-    /// block being written in.
+    /// The anchor and the head of the selected text, within a block or across blocks.
+    fn text_endpoints(&self) -> Option<(TextPosition, TextPosition)> {
+        match &self.selection {
+            Selection::Text(selection) => Some((
+                TextPosition {
+                    block: selection.block,
+                    offset: selection.tail(),
+                },
+                TextPosition {
+                    block: selection.block,
+                    offset: selection.head(),
+                },
+            )),
+            Selection::Span { anchor, head } => Some((*anchor, *head)),
+            Selection::None | Selection::Blocks { .. } => None,
+        }
+    }
+
+    /// The selected text across blocks, as its start and end in document order.
+    fn span(&self) -> Option<(TextPosition, TextPosition)> {
+        match &self.selection {
+            Selection::Span { anchor, head } => self.document.in_order(*anchor, *head),
+            _ => None,
+        }
+    }
+
+    /// The siblings the current selection acts on as blocks: the selected blocks, the block
+    /// being written in, or the blocks that text selected across blocks reaches into.
     fn block_range(&self) -> Option<(BlockId, BlockId)> {
         match &self.selection {
             Selection::None => None,
             Selection::Blocks { anchor, head } => Some((*anchor, *head)),
             Selection::Text(selection) => Some((selection.block, selection.block)),
+            Selection::Span { anchor, head } => {
+                self.document.covering_siblings(anchor.block, head.block)
+            }
+        }
+    }
+
+    /// The selection that platform text input (an input method, dictation) sees: the
+    /// selected text of the block being written in. Of a selection across blocks it sees the
+    /// part in the block that has the caret.
+    fn input_selection(&self) -> Option<TextSelection> {
+        match &self.selection {
+            Selection::Text(selection) => Some(selection.clone()),
+            Selection::Span { anchor, head } => {
+                let length = self.document.block(head.block)?.text.len();
+                let offset = head.offset.min(length);
+                let reversed = self.document.order(head.block, anchor.block)? == Ordering::Less;
+                Some(TextSelection {
+                    block: head.block,
+                    range: if reversed { offset..length } else { 0..offset },
+                    reversed,
+                })
+            }
+            Selection::None | Selection::Blocks { .. } => None,
         }
     }
 
     fn active_text(&self) -> Option<&RichText> {
-        let selection = self.text_selection()?;
+        let selection = self.input_selection()?;
         self.document
             .block(selection.block)
             .map(|block| &block.text)
@@ -390,6 +439,61 @@ impl Editor {
 
     fn set_caret(&mut self, block: BlockId, offset: usize, cx: &mut Context<Self>) {
         self.set_selection(Selection::Text(TextSelection::caret(block, offset)), cx);
+    }
+
+    /// Selects the text from `anchor` to `head`, which may be in different blocks.
+    fn select_text(&mut self, anchor: TextPosition, head: TextPosition, cx: &mut Context<Self>) {
+        self.set_selection(text_selection_between(anchor, head), cx);
+    }
+
+    /// Moves the head of the text selection to `head`, or the caret when not `extend`ing.
+    fn move_head(
+        &mut self,
+        anchor: TextPosition,
+        head: TextPosition,
+        extend: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if extend {
+            self.select_text(anchor, head, cx);
+        } else {
+            self.set_caret(head.block, head.offset, cx);
+        }
+    }
+
+    /// Deletes the text selected across blocks, leaving the caret where it started. That is
+    /// one undo step.
+    fn delete_span(&mut self, cx: &mut Context<Self>) -> Option<TextSelection> {
+        let (start, end) = self.span()?;
+        let mut caret = None;
+        self.transact(EditKind::Other, cx, |this| {
+            let Some(position) = this.document.delete_span(start, end) else {
+                return false;
+            };
+            let selection = TextSelection::caret(position.block, position.offset);
+            this.selection = Selection::Text(selection.clone());
+            caret = Some(selection);
+            true
+        });
+        caret
+    }
+
+    /// Replaces the text selected across blocks by what `then` does at the caret that is left
+    /// when it is deleted. The deletion and the edit that follows are one undo step.
+    fn replace_span(
+        &mut self,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, TextSelection, &mut Context<Self>),
+    ) {
+        let steps = self.history.undo.len();
+        let Some(caret) = self.delete_span(cx) else {
+            return;
+        };
+        then(self, caret, cx);
+        if self.history.undo.len() == steps + 2 {
+            // Drop the snapshot of the state in between, so that undo goes back to before both.
+            self.history.undo.remove(steps + 1);
+        }
     }
 
     /// Enters writing mode at the end of `block`. A divider has no text to write in, so a
@@ -530,7 +634,9 @@ impl Editor {
                 let target = self.document.previous(head).unwrap_or(head);
                 self.select_block(target, cx);
             }
-            Selection::Text(_) => self.move_caret_vertically(Direction::Backward, false, cx),
+            Selection::Text(_) | Selection::Span { .. } => {
+                self.move_caret_vertically(Direction::Backward, false, cx)
+            }
         }
     }
 
@@ -541,7 +647,9 @@ impl Editor {
                 let target = self.document.next(head).unwrap_or(head);
                 self.select_block(target, cx);
             }
-            Selection::Text(_) => self.move_caret_vertically(Direction::Forward, false, cx),
+            Selection::Text(_) | Selection::Span { .. } => {
+                self.move_caret_vertically(Direction::Forward, false, cx)
+            }
         }
     }
 
@@ -553,7 +661,9 @@ impl Editor {
                     self.select_block(parent, cx);
                 }
             }
-            Selection::Text(_) => self.move_caret(Direction::Backward, Unit::Character, false, cx),
+            Selection::Text(_) | Selection::Span { .. } => {
+                self.move_caret(Direction::Backward, Unit::Character, false, cx)
+            }
         }
     }
 
@@ -565,7 +675,9 @@ impl Editor {
                     self.select_block(child, cx);
                 }
             }
-            Selection::Text(_) => self.move_caret(Direction::Forward, Unit::Character, false, cx),
+            Selection::Text(_) | Selection::Span { .. } => {
+                self.move_caret(Direction::Forward, Unit::Character, false, cx)
+            }
         }
     }
 
@@ -577,7 +689,9 @@ impl Editor {
                     self.set_selection(Selection::Blocks { anchor, head }, cx);
                 }
             }
-            Selection::Text(_) => self.move_caret_vertically(Direction::Backward, true, cx),
+            Selection::Text(_) | Selection::Span { .. } => {
+                self.move_caret_vertically(Direction::Backward, true, cx)
+            }
         }
     }
 
@@ -589,7 +703,9 @@ impl Editor {
                     self.set_selection(Selection::Blocks { anchor, head }, cx);
                 }
             }
-            Selection::Text(_) => self.move_caret_vertically(Direction::Forward, true, cx),
+            Selection::Text(_) | Selection::Span { .. } => {
+                self.move_caret_vertically(Direction::Forward, true, cx)
+            }
         }
     }
 
@@ -663,22 +779,22 @@ impl Editor {
         self.move_caret(Direction::Forward, Unit::Line, true, cx);
     }
 
-    /// The offset reached from `offset` by moving one `unit` within the block's text, and
+    /// The offset reached from `position` by moving one `unit` within the block's text, and
     /// whether the caret then sits on the upstream side of a soft wrap.
     fn offset_after_move(
         &self,
-        selection: &TextSelection,
+        position: TextPosition,
         direction: Direction,
         unit: Unit,
     ) -> (usize, bool) {
         let Some(text) = self
             .document
-            .block(selection.block)
+            .block(position.block)
             .map(|block| block.text.text())
         else {
-            return (selection.head(), false);
+            return (position.offset, false);
         };
-        let offset = selection.head();
+        let offset = position.offset;
         match (unit, direction) {
             (Unit::Character, Direction::Backward) => (previous_grapheme(text, offset), false),
             (Unit::Character, Direction::Forward) => (next_grapheme(text, offset), false),
@@ -686,7 +802,7 @@ impl Editor {
             (Unit::Word, Direction::Forward) => (next_word_end(text, offset), false),
             (Unit::Line, _) => {
                 let layouts = self.layouts.borrow();
-                let Some(layout) = layouts.get(&selection.block) else {
+                let Some(layout) = layouts.get(&position.block) else {
                     return match direction {
                         Direction::Backward => (0, false),
                         Direction::Forward => (text.len(), false),
@@ -705,6 +821,31 @@ impl Editor {
         }
     }
 
+    /// Where the caret at `head` goes when it moves one `unit`, and whether it then sits on
+    /// the upstream side of a soft wrap. At the edge of the block it continues into the
+    /// neighboring one. `None` when there is nowhere to go.
+    fn position_after_move(
+        &self,
+        head: TextPosition,
+        direction: Direction,
+        unit: Unit,
+    ) -> Option<(TextPosition, bool)> {
+        let (offset, upstream) = self.offset_after_move(head, direction, unit);
+        if offset != head.offset || unit == Unit::Line {
+            let position = TextPosition {
+                block: head.block,
+                offset,
+            };
+            return Some((position, upstream));
+        }
+        let block = self.adjacent_text_block(head.block, direction)?;
+        let offset = match direction {
+            Direction::Backward => self.document.block(block)?.text.len(),
+            Direction::Forward => 0,
+        };
+        Some((TextPosition { block, offset }, false))
+    }
+
     fn move_caret(
         &mut self,
         direction: Direction,
@@ -712,45 +853,32 @@ impl Editor {
         extend: bool,
         cx: &mut Context<Self>,
     ) {
-        let Some(selection) = self.text_selection().cloned() else {
+        let Some((anchor, head)) = self.text_endpoints() else {
             return;
         };
         if extend {
-            let (head, upstream) = self.offset_after_move(&selection, direction, unit);
-            self.set_selection(Selection::Text(selection.with_head(head)), cx);
+            let (head, upstream) = self
+                .position_after_move(head, direction, unit)
+                .unwrap_or((head, false));
+            self.select_text(anchor, head, cx);
             self.caret_upstream = upstream;
             return;
         }
-        if unit == Unit::Character && !selection.range.is_empty() {
-            let offset = match direction {
-                Direction::Backward => selection.range.start,
-                Direction::Forward => selection.range.end,
+        if unit == Unit::Character && anchor != head {
+            // Moving by a character collapses a selection to the side it is moved towards.
+            let Some((start, end)) = self.document.in_order(anchor, head) else {
+                return;
             };
-            self.set_caret(selection.block, offset, cx);
+            let position = match direction {
+                Direction::Backward => start,
+                Direction::Forward => end,
+            };
+            self.set_caret(position.block, position.offset, cx);
             return;
         }
-        let (offset, upstream) = self.offset_after_move(&selection, direction, unit);
-        if offset != selection.head() || unit == Unit::Line {
-            self.set_caret(selection.block, offset, cx);
+        if let Some((position, upstream)) = self.position_after_move(head, direction, unit) {
+            self.set_caret(position.block, position.offset, cx);
             self.caret_upstream = upstream;
-            return;
-        }
-        // At the edge of the block, the caret continues into the neighboring one.
-        match direction {
-            Direction::Backward => {
-                if let Some(block) = self.adjacent_text_block(selection.block, direction) {
-                    let end = self
-                        .document
-                        .block(block)
-                        .map_or(0, |block| block.text.len());
-                    self.set_caret(block, end, cx);
-                }
-            }
-            Direction::Forward => {
-                if let Some(block) = self.adjacent_text_block(selection.block, direction) {
-                    self.set_caret(block, 0, cx);
-                }
-            }
         }
     }
 
@@ -774,51 +902,48 @@ impl Editor {
         extend: bool,
         cx: &mut Context<Self>,
     ) {
-        let Some(selection) = self.text_selection().cloned() else {
+        let Some((anchor, head)) = self.text_endpoints() else {
             return;
         };
         let text_length = self
             .document
-            .block(selection.block)
+            .block(head.block)
             .map_or(0, |block| block.text.len());
-        let block_edge = match direction {
-            Direction::Backward => 0,
-            Direction::Forward => text_length,
+        let block_edge = TextPosition {
+            block: head.block,
+            offset: match direction {
+                Direction::Backward => 0,
+                Direction::Forward => text_length,
+            },
         };
 
         let layouts = self.layouts.borrow().clone();
-        let Some(layout) = layouts.get(&selection.block) else {
+        let Some(layout) = layouts.get(&head.block) else {
             // Without a layout (nothing was painted yet) rows are unknown, so the caret moves
             // by whole blocks.
-            let target = self.adjacent_text_block(selection.block, direction);
-            match target {
-                Some(block) if !extend => {
-                    let offset = match direction {
+            let target = self.adjacent_text_block(head.block, direction);
+            let position = match target {
+                Some(block) => TextPosition {
+                    block,
+                    offset: match direction {
                         Direction::Backward => self
                             .document
                             .block(block)
                             .map_or(0, |block| block.text.len()),
                         Direction::Forward => 0,
-                    };
-                    self.set_caret(block, offset, cx);
-                }
-                _ => self.set_selection(
-                    Selection::Text(if extend {
-                        selection.with_head(block_edge)
-                    } else {
-                        TextSelection::caret(selection.block, block_edge)
-                    }),
-                    cx,
-                ),
-            }
+                    },
+                },
+                None => block_edge,
+            };
+            self.move_head(anchor, position, extend, cx);
             return;
         };
 
         let rows = layout.rows();
-        let row_index = layout.row_index(&rows, selection.head(), self.caret_upstream);
+        let row_index = layout.row_index(&rows, head.offset, self.caret_upstream);
         let goal_x = self.goal_x.unwrap_or_else(|| {
             rows.get(row_index).map_or(layout.bounds.left(), |row| {
-                layout.bounds.left() + layout.x_in_row(row, selection.head())
+                layout.bounds.left() + layout.x_in_row(row, head.offset)
             })
         });
         let target_row = match direction {
@@ -828,31 +953,20 @@ impl Editor {
 
         if let Some(row) = target_row.and_then(|index| rows.get(index)) {
             let (offset, upstream) = layout.offset_in_row(row, goal_x - layout.bounds.left());
-            let selection = if extend {
-                selection.with_head(offset)
-            } else {
-                TextSelection::caret(selection.block, offset)
+            let position = TextPosition {
+                block: head.block,
+                offset,
             };
-            self.set_selection(Selection::Text(selection), cx);
+            self.move_head(anchor, position, extend, cx);
             self.caret_upstream = upstream;
             self.goal_x = Some(goal_x);
             return;
         }
 
-        // A text selection stays within its block, so extending past the first or last row
-        // selects up to the edge of the block.
-        let neighbor = if extend {
-            None
-        } else {
-            self.adjacent_text_block(selection.block, direction)
-        };
-        let Some(neighbor) = neighbor else {
-            let selection = if extend {
-                selection.with_head(block_edge)
-            } else {
-                TextSelection::caret(selection.block, block_edge)
-            };
-            self.set_selection(Selection::Text(selection), cx);
+        // Past the first or last row the caret continues into the neighboring block, and
+        // below the last one there is nowhere to go but the edge of the text.
+        let Some(neighbor) = self.adjacent_text_block(head.block, direction) else {
+            self.move_head(anchor, block_edge, extend, cx);
             return;
         };
         let (offset, upstream) = match layouts.get(&neighbor) {
@@ -868,7 +982,11 @@ impl Editor {
             }
             None => (0, false),
         };
-        self.set_caret(neighbor, offset, cx);
+        let position = TextPosition {
+            block: neighbor,
+            offset,
+        };
+        self.move_head(anchor, position, extend, cx);
         self.caret_upstream = upstream;
         self.goal_x = Some(goal_x);
     }
@@ -878,6 +996,12 @@ impl Editor {
             Selection::None => {}
             Selection::Blocks { .. } => self.set_selection(Selection::None, cx),
             Selection::Text(selection) => self.select_block(selection.block, cx),
+            Selection::Span { .. } => {
+                // The blocks the text reaches into become the selected blocks.
+                if let Some((anchor, head)) = self.block_range() {
+                    self.set_selection(Selection::Blocks { anchor, head }, cx);
+                }
+            }
         }
     }
 
@@ -886,6 +1010,9 @@ impl Editor {
             Selection::None => self.start_writing(self.document.last(), cx),
             Selection::Blocks { head, .. } => self.start_writing(head, cx),
             Selection::Text(selection) => self.newline(selection, cx),
+            Selection::Span { .. } => {
+                self.replace_span(cx, |this, caret, cx| this.newline(caret, cx));
+            }
         }
     }
 
@@ -961,16 +1088,19 @@ impl Editor {
     }
 
     fn line_break(&mut self, _: &LineBreak, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(selection) = self.text_selection().cloned() else {
-            return;
+        let (block, range) = match (self.text_selection(), self.span()) {
+            (Some(selection), _) => (selection.block, selection.range.clone()),
+            // The line break lands where the selection starts.
+            (None, Some((start, _))) => (start.block, 0..0),
+            (None, None) => return,
         };
         let is_heading = self
             .document
-            .block(selection.block)
+            .block(block)
             .is_some_and(|block| matches!(block.kind, BlockKind::Heading(_)));
         // A Markdown heading is a single line.
         if !is_heading {
-            self.insert_text(selection.range, "\n", cx);
+            self.insert_text(range, "\n", cx);
         }
     }
 
@@ -1067,11 +1197,19 @@ impl Editor {
                 });
                 return;
             }
+            Selection::Span { .. } => {
+                self.delete_span(cx);
+                return;
+            }
             Selection::Text(selection) => selection,
         };
         let id = selection.block;
         let range = if selection.range.is_empty() {
-            let (target, _) = self.offset_after_move(&selection, direction, unit);
+            let head = TextPosition {
+                block: id,
+                offset: selection.head(),
+            };
+            let (target, _) = self.offset_after_move(head, direction, unit);
             target.min(selection.head())..target.max(selection.head())
         } else {
             selection.range.clone()
@@ -1157,6 +1295,8 @@ impl Editor {
         }
     }
 
+    /// Selects the text of the block being written in; when that is selected already, or
+    /// text is selected across blocks, the text of the whole document.
     fn select_all(&mut self, _: &SelectAll, _window: &mut Window, cx: &mut Context<Self>) {
         match self.selection.clone() {
             Selection::Text(selection) => {
@@ -1164,6 +1304,10 @@ impl Editor {
                     .document
                     .block(selection.block)
                     .map_or(0, |block| block.text.len());
+                if selection.range == (0..length) {
+                    self.select_all_text(cx);
+                    return;
+                }
                 self.set_selection(
                     Selection::Text(TextSelection {
                         block: selection.block,
@@ -1173,6 +1317,7 @@ impl Editor {
                     cx,
                 );
             }
+            Selection::Span { .. } => self.select_all_text(cx),
             Selection::None | Selection::Blocks { .. } => {
                 let blocks = self.document.blocks();
                 if let (Some(first), Some(last)) = (blocks.first(), blocks.last()) {
@@ -1188,14 +1333,41 @@ impl Editor {
         }
     }
 
+    /// Selects the text from the start of the first block that has some to the end of the
+    /// last one.
+    fn select_all_text(&mut self, cx: &mut Context<Self>) {
+        let rows = self.document.rows();
+        let mut text_blocks = rows.iter().filter(|row| row.block.kind.has_text());
+        let Some(first) = text_blocks.next() else {
+            return;
+        };
+        let last = text_blocks.next_back().unwrap_or(first);
+        let anchor = TextPosition {
+            block: first.block.id,
+            offset: 0,
+        };
+        let head = TextPosition {
+            block: last.block.id,
+            offset: last.block.text.len(),
+        };
+        self.select_text(anchor, head, cx);
+    }
+
     fn is_verbatim(&self, block: BlockId) -> bool {
         self.document
             .block(block)
             .is_some_and(|block| block.kind.is_verbatim())
     }
 
-    /// Replaces `range` of the block being written in with `text`, as typing does.
+    /// Replaces `range` of the block being written in with `text`, as typing does. Text
+    /// selected across blocks is what gets replaced, whatever `range` is.
     fn insert_text(&mut self, range: Range<usize>, text: &str, cx: &mut Context<Self>) {
+        if self.span().is_some() {
+            self.replace_span(cx, |this, caret, cx| {
+                this.insert_text(caret.range, text, cx)
+            });
+            return;
+        }
         let Some(selection) = self.text_selection().cloned() else {
             return;
         };
@@ -1287,7 +1459,44 @@ impl Editor {
         self.toggle_mark(Mark::Strikethrough, cx);
     }
 
+    /// The parts of the text selected across blocks that can carry marks and links: the ones
+    /// that are not empty and not literal text.
+    fn styleable_span_ranges(&self) -> Vec<(BlockId, Range<usize>)> {
+        let Some((start, end)) = self.span() else {
+            return Vec::new();
+        };
+        self.document
+            .span_ranges(start, end)
+            .into_iter()
+            .filter(|(block, range)| !range.is_empty() && !block.kind.is_verbatim())
+            .map(|(block, range)| (block.id, range))
+            .collect()
+    }
+
+    /// Sets the mark on all of the selected text, unless it has the mark everywhere already,
+    /// when it is removed.
+    fn toggle_span_mark(&mut self, mark: Mark, cx: &mut Context<Self>) {
+        let ranges = self.styleable_span_ranges();
+        let marked_everywhere = ranges.iter().all(|(id, range)| {
+            self.document
+                .block(*id)
+                .is_some_and(|block| block.text.has_mark(range.clone(), mark))
+        });
+        self.transact(EditKind::Other, cx, |this| {
+            for (id, range) in &ranges {
+                if let Some(block) = this.document.block_mut(*id) {
+                    block.text.set_mark(range.clone(), mark, !marked_everywhere);
+                }
+            }
+            !ranges.is_empty()
+        });
+    }
+
     fn toggle_mark(&mut self, mark: Mark, cx: &mut Context<Self>) {
+        if self.span().is_some() {
+            self.toggle_span_mark(mark, cx);
+            return;
+        }
         let Some(selection) = self.text_selection().cloned() else {
             return;
         };
@@ -1344,8 +1553,9 @@ impl Editor {
         }
     }
 
-    /// What copying the selection puts on the clipboard: the plain selected text in writing
-    /// mode, and the selected blocks as Markdown in navigation mode.
+    /// What copying the selection puts on the clipboard: the plain selected text within a
+    /// block, and the selected blocks as Markdown otherwise. Text selected across blocks
+    /// is the blocks it reaches into, with the first and the last one cut to the selection.
     fn selected_content(&self) -> Option<String> {
         match &self.selection {
             Selection::None => None,
@@ -1356,6 +1566,12 @@ impl Editor {
             Selection::Text(selection) => {
                 let text = self.document.block(selection.block)?.text.text();
                 (!selection.range.is_empty()).then(|| text[selection.range.clone()].to_string())
+            }
+            Selection::Span { .. } => {
+                let (start, end) = self.span()?;
+                Some(markdown::serialize_blocks(
+                    &self.document.copy_span(start, end),
+                ))
             }
         }
     }
@@ -1368,7 +1584,24 @@ impl Editor {
             Selection::None => {}
             Selection::Blocks { anchor, head } => self.paste_blocks(anchor, head, &text, cx),
             Selection::Text(selection) => self.paste_text(selection, &text, cx),
+            Selection::Span { .. } => match pasted_url(&text) {
+                Some(url) => self.link_span(url, cx),
+                None => self.replace_span(cx, |this, caret, cx| this.paste_text(caret, &text, cx)),
+            },
         }
+    }
+
+    /// Makes the text selected across blocks a link, as pasting a URL over it does.
+    fn link_span(&mut self, url: Arc<str>, cx: &mut Context<Self>) {
+        let ranges = self.styleable_span_ranges();
+        self.transact(EditKind::Other, cx, |this| {
+            for (id, range) in &ranges {
+                if let Some(block) = this.document.block_mut(*id) {
+                    block.text.set_link(range.clone(), Some(url.clone()));
+                }
+            }
+            !ranges.is_empty()
+        });
     }
 
     fn paste_blocks(&mut self, anchor: BlockId, head: BlockId, text: &str, cx: &mut Context<Self>) {
@@ -1489,47 +1722,63 @@ impl Editor {
         }
         let text = block.text.text();
         let selection = match event.click_count {
-            1 => match self.text_selection() {
-                Some(selection) if event.modifiers.shift && selection.block == id => {
-                    selection.with_head(offset)
+            1 => match self.text_endpoints() {
+                // Shift extends the selection from where it started, into any block.
+                Some((anchor, _)) if event.modifiers.shift => {
+                    text_selection_between(anchor, TextPosition { block: id, offset })
                 }
-                _ => TextSelection::caret(id, offset),
+                _ => Selection::Text(TextSelection::caret(id, offset)),
             },
-            2 => {
-                let range = word_range(text, offset);
-                TextSelection {
-                    block: id,
-                    range,
-                    reversed: false,
-                }
-            }
-            _ => TextSelection {
+            2 => Selection::Text(TextSelection {
+                block: id,
+                range: word_range(text, offset),
+                reversed: false,
+            }),
+            _ => Selection::Text(TextSelection {
                 block: id,
                 range: 0..text.len(),
                 reversed: false,
-            },
+            }),
         };
         self.is_selecting = event.click_count == 1;
-        self.set_selection(Selection::Text(selection), cx);
+        self.set_selection(selection, cx);
         self.caret_upstream = upstream;
+    }
+
+    /// The text position that dragging the mouse to `point` selects up to, when the
+    /// selection started at `anchor`. A block without text (a divider) cannot be selected up
+    /// to, so the selection stops just short of it.
+    fn position_for_drag(
+        &self,
+        point: Point<Pixels>,
+        anchor: TextPosition,
+    ) -> Option<TextPosition> {
+        let (id, layout) = self.block_at(point)?;
+        if self.document.block(id)?.kind.has_text() {
+            let (offset, _) = layout.offset_for_point(point);
+            return Some(TextPosition { block: id, offset });
+        }
+        if self.document.order(id, anchor.block)? == Ordering::Greater {
+            let block = self.adjacent_text_block(id, Direction::Backward)?;
+            let offset = self.document.block(block)?.text.len();
+            Some(TextPosition { block, offset })
+        } else {
+            let block = self.adjacent_text_block(id, Direction::Forward)?;
+            Some(TextPosition { block, offset: 0 })
+        }
     }
 
     fn mouse_move(&mut self, event: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
         if !self.is_selecting || !event.dragging() {
             return;
         }
-        let Some(selection) = self.text_selection().cloned() else {
+        let Some((anchor, head)) = self.text_endpoints() else {
             return;
         };
-        let offset = {
-            let layouts = self.layouts.borrow();
-            let Some(layout) = layouts.get(&selection.block) else {
-                return;
-            };
-            layout.offset_for_point(event.position).0
-        };
-        if offset != selection.head() {
-            self.set_selection(Selection::Text(selection.with_head(offset)), cx);
+        if let Some(position) = self.position_for_drag(event.position, anchor)
+            && position != head
+        {
+            self.select_text(anchor, position, cx);
         }
     }
 
@@ -1549,6 +1798,9 @@ impl Editor {
                 Selection::Text(selection) => layouts
                     .get(&selection.block)
                     .and_then(|layout| layout.caret_bounds(selection.head(), self.caret_upstream)),
+                Selection::Span { head, .. } => layouts
+                    .get(&head.block)
+                    .and_then(|layout| layout.caret_bounds(head.offset, self.caret_upstream)),
             }
         };
         let Some(target) = target else {
@@ -1672,6 +1924,7 @@ impl Editor {
         block: &Block,
         theme: &Theme,
         is_focused: bool,
+        span_range: Option<Range<usize>>,
         cx: &mut Context<Self>,
     ) -> BlockText {
         let text = SharedString::from(block.text.text().to_string());
@@ -1691,6 +1944,13 @@ impl Editor {
                 });
             }
         }
+        if let Some(range) = span_range {
+            element = element.selection(range, theme.text_selection);
+            // Text input goes to the block that has the caret.
+            if matches!(&self.selection, Selection::Span { head, .. } if head.block == block.id) {
+                element = element.input(self.focus_handle.clone(), cx.entity());
+            }
+        }
         element
     }
 
@@ -1699,6 +1959,7 @@ impl Editor {
         row: &Row,
         highlight: RowHighlight,
         is_focused: bool,
+        span_range: Option<Range<usize>>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1773,66 +2034,65 @@ impl Editor {
             _ => None,
         };
 
-        let content = match &block.kind {
-            BlockKind::Divider => {
-                let layouts = self.layouts.clone();
-                let color = theme.faint;
-                div()
-                    .flex_1()
-                    .h(px(25.))
-                    .child(
-                        canvas(
-                            |_, _, _| {},
-                            move |bounds, _, window, _| {
-                                let line = Bounds::new(
-                                    point(bounds.left(), bounds.center().y),
-                                    gpui::size(bounds.size.width, px(1.)),
-                                );
-                                window.paint_quad(fill(line, color));
-                                layouts
-                                    .borrow_mut()
-                                    .insert(id, BlockLayout::without_text(bounds));
-                            },
+        let content =
+            match &block.kind {
+                BlockKind::Divider => {
+                    let layouts = self.layouts.clone();
+                    let color = theme.faint;
+                    div()
+                        .flex_1()
+                        .h(px(25.))
+                        .child(
+                            canvas(
+                                |_, _, _| {},
+                                move |bounds, _, window, _| {
+                                    let line = Bounds::new(
+                                        point(bounds.left(), bounds.center().y),
+                                        gpui::size(bounds.size.width, px(1.)),
+                                    );
+                                    window.paint_quad(fill(line, color));
+                                    layouts
+                                        .borrow_mut()
+                                        .insert(id, BlockLayout::without_text(bounds));
+                                },
+                            )
+                            .size_full(),
                         )
-                        .size_full(),
-                    )
-                    .into_any_element()
-            }
-            BlockKind::Code { .. } | BlockKind::Raw => {
-                let label = match &block.kind {
-                    BlockKind::Code { language } => language.clone(),
-                    _ => "markdown".to_string(),
-                };
-                div()
+                        .into_any_element()
+                }
+                BlockKind::Code { .. } | BlockKind::Raw => {
+                    let label = match &block.kind {
+                        BlockKind::Code { language } => language.clone(),
+                        _ => "markdown".to_string(),
+                    };
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .px(px(12.))
+                        .py(px(8.))
+                        .rounded(px(6.))
+                        .bg(theme.code_background)
+                        .when(!label.is_empty(), |code| {
+                            code.child(
+                                div()
+                                    .text_size(px(11.))
+                                    .line_height(px(16.))
+                                    .text_color(theme.muted)
+                                    .child(label),
+                            )
+                        })
+                        .child(div().cursor_text().child(
+                            self.render_block_text(block, theme, is_focused, span_range, cx),
+                        ))
+                        .into_any_element()
+                }
+                _ => div()
                     .flex_1()
                     .min_w_0()
-                    .px(px(12.))
-                    .py(px(8.))
-                    .rounded(px(6.))
-                    .bg(theme.code_background)
-                    .when(!label.is_empty(), |code| {
-                        code.child(
-                            div()
-                                .text_size(px(11.))
-                                .line_height(px(16.))
-                                .text_color(theme.muted)
-                                .child(label),
-                        )
-                    })
-                    .child(
-                        div()
-                            .cursor_text()
-                            .child(self.render_block_text(block, theme, is_focused, cx)),
-                    )
-                    .into_any_element()
-            }
-            _ => div()
-                .flex_1()
-                .min_w_0()
-                .cursor_text()
-                .child(self.render_block_text(block, theme, is_focused, cx))
-                .into_any_element(),
-        };
+                    .cursor_text()
+                    .child(self.render_block_text(block, theme, is_focused, span_range, cx))
+                    .into_any_element(),
+            };
 
         div()
             .w_full()
@@ -1914,10 +2174,29 @@ impl Render for Editor {
             cx.on_next_frame(window, |this, _, cx| this.scroll_selection_into_view(cx));
         }
         let rows = self.document.rows();
-        let selected_blocks = match &self.selection {
+        let mut selected_blocks = match &self.selection {
             Selection::Blocks { anchor, head } => self.document.subtree_ids(*anchor, *head),
             _ => HashSet::new(),
         };
+        // Text selected across blocks highlights the selected part of each block's text. A
+        // block without text (a divider) is highlighted as a whole.
+        let mut span_ranges = HashMap::new();
+        if let Some((start, end)) = self.span() {
+            for (block, range) in self.document.span_ranges(start, end) {
+                if !block.kind.has_text() {
+                    selected_blocks.insert(block.id);
+                    continue;
+                }
+                // Where the selection goes on into the next block, the highlight runs past
+                // the end of the text, which shows as a line break.
+                let selected_end = if block.id == end.block {
+                    range.end
+                } else {
+                    range.end + 1
+                };
+                span_ranges.insert(block.id, range.start..selected_end);
+            }
+        }
         {
             let row_ids: HashSet<BlockId> = rows.iter().map(|row| row.block.id).collect();
             self.layouts
@@ -1937,7 +2216,8 @@ impl Render for Editor {
                 first: selected && !index.checked_sub(1).is_some_and(is_selected),
                 last: selected && !is_selected(index + 1),
             };
-            elements.push(self.render_row(row, highlight, is_focused, &theme, cx));
+            let span_range = span_ranges.remove(&row.block.id);
+            elements.push(self.render_row(row, highlight, is_focused, span_range, &theme, cx));
         }
 
         let mode = match self.mode() {
@@ -2053,7 +2333,7 @@ impl EntityInputHandler for Editor {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        let selection = self.text_selection()?;
+        let selection = self.input_selection()?;
         let text = self.active_text()?.text();
         Some(UTF16Selection {
             range: range_to_utf16(text, &selection.range),
@@ -2084,6 +2364,12 @@ impl EntityInputHandler for Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.span().is_some() {
+            // The text typed replaces what is selected across blocks.
+            self.marked_range = None;
+            self.insert_text(0..0, new_text, cx);
+            return;
+        }
         let Some(selection) = self.text_selection().cloned() else {
             return;
         };
@@ -2106,6 +2392,12 @@ impl EntityInputHandler for Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let mut range_utf16 = range_utf16;
+        if self.span().is_some() {
+            // Composing starts by deleting what is selected across blocks.
+            self.delete_span(cx);
+            range_utf16 = None;
+        }
         let Some(selection) = self.text_selection().cloned() else {
             return;
         };
@@ -2138,7 +2430,7 @@ impl EntityInputHandler for Editor {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        let selection = self.text_selection()?;
+        let selection = self.input_selection()?;
         let range = range_from_utf16(self.active_text()?.text(), &range_utf16);
         let layouts = self.layouts.borrow();
         let layout = layouts.get(&selection.block)?;
@@ -2155,12 +2447,25 @@ impl EntityInputHandler for Editor {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
-        let selection = self.text_selection()?;
+        let selection = self.input_selection()?;
         let text = self.active_text()?.text();
         let layouts = self.layouts.borrow();
         let (offset, _) = layouts.get(&selection.block)?.offset_for_point(point);
         Some(offset_to_utf16(text, offset))
     }
+}
+
+/// The selection of the text from `anchor` to `head`: a selection within a block when they
+/// are in the same one, and across blocks otherwise.
+fn text_selection_between(anchor: TextPosition, head: TextPosition) -> Selection {
+    if anchor.block != head.block {
+        return Selection::Span { anchor, head };
+    }
+    Selection::Text(TextSelection {
+        block: anchor.block,
+        range: anchor.offset.min(head.offset)..anchor.offset.max(head.offset),
+        reversed: head.offset < anchor.offset,
+    })
 }
 
 /// The block type that typing `marker` followed by a space at the start of a block of type

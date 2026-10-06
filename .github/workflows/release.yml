@@ -1,0 +1,156 @@
+name: Release
+
+# Cuts a release from main. It bumps the version and CHANGELOG.md from the commits merged
+# since the last release, tests and builds, pushes the version commit, then tags it and
+# publishes a GitHub release with the binary attached. The download also carries the
+# licenses of mrk and of everything linked into it.
+#
+#   gh workflow run release.yml                  # release
+#   gh workflow run release.yml -f dry_run=true  # show and build what would be released
+#
+# A pull request that changes the release setup runs as a dry run, so the setup is tested
+# before it is merged. Re-running a release that failed halfway finishes it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Show and build what would be released, without releasing it
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - release-plz.toml
+      - about.toml
+      - about.hbs
+
+concurrency: release-${{ github.ref }}
+
+permissions:
+  contents: write # push the version commit, create the tag and the release
+  pull-requests: read # release-plz looks up the pull requests behind the released commit
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  DRY_RUN: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run }}
+  TARGET: aarch64-apple-darwin
+  # The SHA-256 of each tool's aarch64-apple-darwin archive, as listed on its release page.
+  RELEASE_PLZ_VERSION: 0.3.169
+  RELEASE_PLZ_SHA256: 3bb728a921e0f9d6aca48723de2d8a49a71099ca8a113efb9350781120648a7e
+  CARGO_ABOUT_VERSION: 0.9.2
+  CARGO_ABOUT_SHA256: ae72f0df0c399a1e96336f696fa55b1b28679fd725632eba8cf8e4568467cc3e
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  release:
+    name: ${{ (github.event_name != 'workflow_dispatch' || inputs.dry_run) && 'Dry run' || 'Release' }}
+    runs-on: macos-latest # Apple Silicon
+    timeout-minutes: 90
+    steps:
+      - name: Refuse to release from a branch other than main
+        if: env.DRY_RUN == 'false' && github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Releases are cut from main. Run this workflow on main, or as a dry run."
+          exit 1
+
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # release-plz reads the history and the tags
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add "$TARGET"
+
+      - name: Install release-plz and cargo-about
+        run: |
+          # install <repository> <release> <archive> <sha256> [<path of the binary in the archive>]
+          install() {
+            gh release download "$2" --repo "$1" --pattern "$3" --dir "$RUNNER_TEMP"
+            echo "$4  $RUNNER_TEMP/$3" | shasum -a 256 --check
+            if [ -n "${5-}" ]; then
+              tar -xzf "$RUNNER_TEMP/$3" -C "$RUNNER_TEMP/bin" --strip-components 1 "$5"
+            else
+              tar -xzf "$RUNNER_TEMP/$3" -C "$RUNNER_TEMP/bin"
+            fi
+          }
+          mkdir "$RUNNER_TEMP/bin"
+          install release-plz/release-plz "release-plz-v$RELEASE_PLZ_VERSION" \
+            "release-plz-$TARGET.tar.gz" "$RELEASE_PLZ_SHA256"
+          install EmbarkStudios/cargo-about "$CARGO_ABOUT_VERSION" \
+            "cargo-about-$CARGO_ABOUT_VERSION-$TARGET.tar.gz" "$CARGO_ABOUT_SHA256" \
+            "cargo-about-$CARGO_ABOUT_VERSION-$TARGET/cargo-about"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Bump the version and update the changelog
+        run: |
+          release-plz update
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          tag="v$version"
+
+          # Only a published release counts as done: a draft is a release that failed halfway.
+          if [ "$DRY_RUN" = false ] &&
+            [ "$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null)" = false ]; then
+            echo "::error::Nothing to release: $tag is published, and no feat, fix, perf or breaking change was merged since."
+            exit 1
+          fi
+
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          echo "PACKAGE=mrk-$tag-$TARGET" >> "$GITHUB_ENV"
+          echo "ARCHIVE=$RUNNER_TEMP/mrk-$tag-$TARGET.tar.gz" >> "$GITHUB_ENV"
+          {
+            echo "## mrk $tag$([ "$DRY_RUN" = true ] && echo ' (dry run)')"
+            awk -v heading="## [$version]" \
+              'index($0, heading) == 1 { printing = 1; next } /^## \[/ { printing = 0 } printing' \
+              CHANGELOG.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build
+        run: cargo build --release --locked --target "$TARGET"
+
+      - name: Package
+        run: |
+          mkdir "$RUNNER_TEMP/$PACKAGE"
+          cp "target/$TARGET/release/mrk" LICENSE-MIT LICENSE-APACHE "$RUNNER_TEMP/$PACKAGE"
+          # Fails on a dependency whose license about.toml does not accept.
+          cargo about generate --locked --fail about.hbs \
+            --output-file "$RUNNER_TEMP/$PACKAGE/THIRD-PARTY-LICENSES.md"
+          tar -czf "$ARCHIVE" -C "$RUNNER_TEMP" "$PACKAGE"
+
+      - name: Keep the binary of a dry run
+        if: env.DRY_RUN == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.PACKAGE }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+      - name: Push the version commit
+        if: env.DRY_RUN == 'false'
+        run: |
+          # Nothing changed when this re-runs a release whose version commit is already on main.
+          if ! git diff --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --all --message "chore: release $TAG"
+            git push origin HEAD:main
+          fi
+
+      - name: Tag the commit and draft the release
+        if: env.DRY_RUN == 'false'
+        run: release-plz release --git-token "$GH_TOKEN"
+
+      - name: Attach the binary and publish the release
+        if: env.DRY_RUN == 'false'
+        run: |
+          gh release upload "$TAG" "$ARCHIVE" --clobber
+          gh release edit "$TAG" --draft=false --latest
+          echo "Released: $(gh release view "$TAG" --json url --jq .url)" >> "$GITHUB_STEP_SUMMARY"

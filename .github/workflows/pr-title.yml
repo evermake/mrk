@@ -1,0 +1,40 @@
+name: PR title
+
+# Pull requests are squashed, and the title becomes the commit on main. release-plz reads
+# that commit to choose the next version and to write the changelog, so the title has to be
+# a Conventional Commit: https://www.conventionalcommits.org
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions: {}
+
+jobs:
+  conventional-commit:
+    name: Conventional Commit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          pattern='^(feat|fix|perf|refactor|docs|test|chore|ci|build|revert)(\([a-z0-9/_-]+\))?!?: [^ ].*$'
+          if [[ "$TITLE" =~ $pattern ]]; then
+            exit 0
+          fi
+          echo "::error::The title must look like \"type: summary\", for example \"feat: open a block with o\"."
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          The title must be a Conventional Commit, `type: summary`, because it becomes the squashed commit:
+
+          | Type | Release notes | Version |
+          | --- | --- | --- |
+          | `feat` | Added | 0.1.0 → 0.1.1 |
+          | `fix` | Fixed | 0.1.0 → 0.1.1 |
+          | `perf` | Changed | 0.1.0 → 0.1.1 |
+          | `refactor`, `docs`, `test`, `chore`, `ci`, `build`, `revert` | not listed | no release of their own |
+          | any type with `!`, as in `feat!: …` | marked as breaking | 0.1.0 → 0.2.0 |
+
+          A scope is optional: `fix(markdown): …`.
+          EOF
+          exit 1

@@ -1,4 +1,4 @@
-use gpui::{Entity, TestAppContext, VisualTestContext};
+use gpui::{Entity, Hsla, TestAppContext, VisualTestContext};
 use pretty_assertions::assert_eq;
 
 use super::*;
@@ -1227,4 +1227,36 @@ fn rescaling_keeps_the_scrolled_part_in_view(cx: &mut TestAppContext) {
     editor.update(&mut cx, |editor, cx| editor.rescale_scroll(0.25, cx));
     cx.run_until_parked();
     assert_eq!(first_visible(&mut cx), Some(before));
+}
+
+#[gpui::test]
+fn selected_inline_code_is_highlighted(cx: &mut TestAppContext) {
+    let (editor, mut cx) = open("an `inline code` example\n", cx);
+    editor.update(&mut cx, |editor, cx| {
+        let block = editor.document.first();
+        let position = |offset| TextPosition { block, offset };
+        editor.select_text(position(0), position("an inline code example".len()), cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        state(&editor, &mut cx),
+        "p «an <code>inline code</code> example»\n"
+    );
+
+    let (theme, quads) = cx.update(|window, _| {
+        let theme = Theme::for_appearance(window.appearance());
+        (theme, window.painted_quads())
+    });
+    let filled = |color: Hsla| {
+        let quads = quads.iter();
+        quads.filter(move |quad| quad.background.as_solid() == Some(color))
+    };
+    let code: Vec<_> = filled(theme.code_background).collect();
+    assert_eq!(code.len(), 1, "the code should have a background");
+    // What is painted later has a higher order and covers what it overlaps.
+    assert!(
+        filled(theme.text_selection).any(|selection| selection.bounds.intersects(&code[0].bounds)
+            && selection.order > code[0].order),
+        "the selection should be painted over the background of the code"
+    );
 }

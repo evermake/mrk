@@ -10,8 +10,8 @@ use gpui::{
     AnyElement, App, Bounds, ClipboardItem, Context, Entity, EntityInputHandler, FocusHandle,
     Focusable, Font, FontStyle, FontWeight, KeyBinding, KeyContext, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Pixels, Point, Rems, ScrollHandle, SharedString,
-    StrikethroughStyle, StyledText, Task, TextRun, UTF16Selection, UnderlineStyle, Window, canvas,
-    div, fill, point, prelude::*, px,
+    StrikethroughStyle, Task, TextRun, UTF16Selection, UnderlineStyle, Window, canvas, div, fill,
+    point, prelude::*, px,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -2079,8 +2079,8 @@ impl Editor {
         cx: &mut Context<Self>,
     ) -> BlockText {
         let text = SharedString::from(block.text.text().to_string());
-        let styled_text = StyledText::new(text).with_runs(self.text_runs(block, theme));
-        let mut element = BlockText::new(block.id, styled_text, self.layouts.clone());
+        let runs = self.text_runs(block, theme);
+        let mut element = BlockText::new(block.id, text, runs, self.layouts.clone());
         if let Some(selection) = self.text_selection()
             && selection.block == block.id
         {

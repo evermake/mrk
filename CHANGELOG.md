@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/evermake/mrk/compare/v0.1.1...v0.1.2) - 2026-10-08
+
+### Added
+
+- show whether the caret is inside or outside inline code at its edges ([#20](https://github.com/evermake/mrk/pull/20))
+
+### Fixed
+
+- show the selection over inline code ([#19](https://github.com/evermake/mrk/pull/19))
+
 ## [0.1.1](https://github.com/evermake/mrk/compare/v0.1.0...v0.1.1) - 2026-10-06
 
 ### Added

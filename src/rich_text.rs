@@ -41,6 +41,19 @@ pub enum Mark {
     Code,
 }
 
+/// An end of a stretch of inline code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodeEdge {
+    Start,
+    End,
+}
+
+#[derive(Clone, Copy)]
+enum Side {
+    Before,
+    After,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Run {
     pub len: usize,
@@ -201,17 +214,31 @@ impl RichText {
             .map(|(_, style)| style)
     }
 
-    /// The style newly typed text should get at `offset`. Marks continue from the character
-    /// before the caret, while links and raw source only continue when the caret is strictly
-    /// inside them, so that typing after a link produces normal text.
-    pub fn typing_style(&self, offset: usize) -> InlineStyle {
-        let offset = self.clamp(offset);
+    /// The styles of the characters that end and that start at `offset`.
+    fn styles_around(&self, offset: usize) -> (Option<&InlineStyle>, Option<&InlineStyle>) {
         let before = self.text[..offset]
             .chars()
             .next_back()
             .and_then(|character| self.style_at(offset - character.len_utf8()));
-        let after = self.style_at(offset);
-        let mut style = before.or(after).cloned().unwrap_or_default();
+        (before, self.style_at(offset))
+    }
+
+    /// The style newly typed text should get at `offset`. Marks continue from the character
+    /// before the caret, while links and raw source only continue when the caret is strictly
+    /// inside them, so that typing after a link produces normal text.
+    pub fn typing_style(&self, offset: usize) -> InlineStyle {
+        self.typing_style_continuing(offset, Side::Before)
+    }
+
+    /// Like [`Self::typing_style`], with the marks continuing from the character on `side` of
+    /// the caret, or from the one on the other side when there is none.
+    fn typing_style_continuing(&self, offset: usize, side: Side) -> InlineStyle {
+        let (before, after) = self.styles_around(self.clamp(offset));
+        let source = match side {
+            Side::Before => before.or(after),
+            Side::After => after.or(before),
+        };
+        let mut style = source.cloned().unwrap_or_default();
         match (before, after) {
             (Some(before), Some(after)) => {
                 if before.link != after.link {
@@ -225,6 +252,32 @@ impl RichText {
             }
         }
         style
+    }
+
+    /// Which end of a stretch of inline code `offset` is at, if it is at one. The caret has
+    /// two places there: inside the code and outside it.
+    pub fn code_edge(&self, offset: usize) -> Option<CodeEdge> {
+        let (before, after) = self.styles_around(self.clamp(offset));
+        let is_code = |style: Option<&InlineStyle>| style.is_some_and(|style| style.code);
+        match (is_code(before), is_code(after)) {
+            (false, true) => Some(CodeEdge::Start),
+            (true, false) => Some(CodeEdge::End),
+            _ => None,
+        }
+    }
+
+    /// The style newly typed text should get at `offset`, an edge of inline code, when the
+    /// caret is `inside` the code or outside it: the text continues what is on that side.
+    /// `None` when no code starts or ends at `offset`.
+    pub fn typing_style_at_code_edge(&self, offset: usize, inside: bool) -> Option<InlineStyle> {
+        let side = match (self.code_edge(offset)?, inside) {
+            (CodeEdge::Start, true) | (CodeEdge::End, false) => Side::After,
+            (CodeEdge::Start, false) | (CodeEdge::End, true) => Side::Before,
+        };
+        let mut style = self.typing_style_continuing(offset, side);
+        // With no text on the outside, the marks are those of the code, without being code.
+        style.code = inside;
+        Some(style)
     }
 
     pub fn link_at(&self, offset: usize) -> Option<&Arc<str>> {
@@ -472,6 +525,60 @@ mod tests {
         assert_eq!(text.typing_style(9), link("https://example.com"));
         assert_eq!(text.typing_style(11), InlineStyle::default());
         assert_eq!(text.typing_style(7), InlineStyle::default());
+    }
+
+    #[test]
+    fn the_edges_of_code_have_a_style_for_each_side() {
+        let mut text = RichText::plain("a code b");
+        text.set_mark(2..6, Mark::Code, true);
+        let style = |offset, inside| text.typing_style_at_code_edge(offset, inside);
+
+        assert_eq!(text.code_edge(2), Some(CodeEdge::Start));
+        assert_eq!(text.code_edge(6), Some(CodeEdge::End));
+        for offset in [0, 1, 3, 5, 7, 8] {
+            assert_eq!(text.code_edge(offset), None, "{offset}");
+            assert_eq!(style(offset, true), None, "{offset}");
+        }
+        for offset in [2, 6] {
+            assert!(style(offset, true).unwrap().code, "{offset}");
+            assert!(!style(offset, false).unwrap().code, "{offset}");
+        }
+        // Without choosing a side, typing continues what is before the caret.
+        assert!(!text.typing_style(2).code);
+        assert!(text.typing_style(6).code);
+    }
+
+    #[test]
+    fn the_sides_of_an_edge_of_code_continue_the_marks_next_to_them() {
+        // Bold, then code in italics, at the end of the text.
+        let mut text = RichText::plain("bold code");
+        text.set_mark(0..4, Mark::Bold, true);
+        text.set_mark(4..9, Mark::Italic, true);
+        text.set_mark(4..9, Mark::Code, true);
+        let style = |offset, inside| text.typing_style_at_code_edge(offset, inside).unwrap();
+        let marks = |style: InlineStyle| (style.bold, style.italic, style.code);
+
+        assert_eq!(marks(style(4, false)), (true, false, false));
+        assert_eq!(marks(style(4, true)), (false, true, true));
+        assert_eq!(marks(style(9, true)), (false, true, true));
+        // Nothing follows the code, so its other marks carry on outside it.
+        assert_eq!(marks(style(9, false)), (false, true, false));
+
+        // Code at the start of the text has nothing before it either.
+        let text = RichText::styled(
+            "code",
+            InlineStyle {
+                code: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(text.code_edge(0), Some(CodeEdge::Start));
+        assert_eq!(text.code_edge(4), Some(CodeEdge::End));
+        assert_eq!(
+            text.typing_style_at_code_edge(0, false),
+            Some(InlineStyle::default())
+        );
+        assert!(text.typing_style(0).code);
     }
 
     #[test]

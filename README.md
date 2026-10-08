@@ -138,6 +138,10 @@ just `***`, `___` or `---` becomes a divider on `Enter`.
   instead, and so does an empty one with no text above the divider to go to.
 - `Tab` / `Shift+Tab` and `Alt+Up` / `Alt+Down` act on the block being written in.
 - `Cmd+E` toggles inline code and `Cmd+Shift+X` strikethrough.
+- Inline code has a little padding inside its box, and the caret has two places at each end
+  of it: inside the box, where what is typed next is code, and outside it, where it is not.
+  `Left` / `Right` stop at both, a click picks the nearer one, and `Cmd+E` switches between
+  them. This is also the way to write text right before or after code at the edge of a block.
 - `Cmd`-click opens a link.
 - Double-click selects a word; holding the button down on the second click and dragging
   selects whole words, across blocks too.

@@ -3,6 +3,7 @@ use pretty_assertions::assert_eq;
 
 use super::*;
 
+mod inline_code_edges;
 mod scrollbar;
 mod selection_across_blocks;
 mod typing_shortcuts;
@@ -43,7 +44,11 @@ fn state(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> String {
                 && selection.block == block.id
             {
                 if selection.range.is_empty() {
-                    let style = text.typing_style(selection.head());
+                    // The caret is shown in the style of what would be typed next.
+                    let style = editor
+                        .pending_style
+                        .clone()
+                        .unwrap_or_else(|| text.typing_style(selection.head()));
                     text.insert(selection.head(), "ˇ", style);
                 } else {
                     let style = text

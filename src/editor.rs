@@ -9,16 +9,15 @@ use std::time::{Duration, Instant};
 use gpui::{
     AnyElement, App, Bounds, ClipboardItem, Context, Entity, EntityInputHandler, FocusHandle,
     Focusable, Font, FontStyle, FontWeight, KeyBinding, KeyContext, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, Rems, ScrollHandle, SharedString,
-    StrikethroughStyle, Task, TextRun, UTF16Selection, UnderlineStyle, Window, canvas, div, fill,
-    point, prelude::*, px,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, Rems, ScrollHandle, StrikethroughStyle, Task,
+    TextRun, UTF16Selection, UnderlineStyle, Window, canvas, div, fill, point, prelude::*, px,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::block_text::{BlockLayout, BlockText, Caret, LayoutMap};
 use crate::document::{Block, BlockId, BlockKind, Document, Row, TextPosition};
 use crate::markdown;
-use crate::rich_text::{InlineStyle, Mark, RichText};
+use crate::rich_text::{CodeEdge, InlineStyle, Mark, RichText};
 use crate::scrollbar::Scrollbar;
 use crate::theme::{MONO_FONT, Theme, UI_FONT};
 use crate::zoom::zoomed;
@@ -287,7 +286,9 @@ pub struct Editor {
     selection: Selection,
     /// The text being composed by an input method, within the block being written in.
     marked_range: Option<Range<usize>>,
-    /// The style for the next typed text, set by toggling a mark with nothing selected.
+    /// The style for the next typed text, set by toggling a mark with nothing selected, or
+    /// by putting the caret on the side of an edge of inline code that typing would not
+    /// continue by itself.
     pending_style: Option<InlineStyle>,
     /// The window x coordinate the caret keeps to while moving vertically.
     goal_x: Option<Pixels>,
@@ -481,6 +482,52 @@ impl Editor {
 
     fn set_caret(&mut self, block: BlockId, offset: usize, cx: &mut Context<Self>) {
         self.set_selection(Selection::Text(TextSelection::caret(block, offset)), cx);
+    }
+
+    /// Which end of a stretch of inline code `position` is at, if it is at one. The caret has
+    /// two places there, inside the code and outside it, and what is typed next goes where
+    /// the caret is.
+    fn code_edge(&self, position: TextPosition) -> Option<CodeEdge> {
+        let block = self.document.block(position.block)?;
+        if block.kind.is_verbatim() {
+            return None;
+        }
+        block.text.code_edge(position.offset)
+    }
+
+    /// Whether what is typed next is inline code. At an edge of inline code that is whether
+    /// the caret is on the inside of it.
+    fn caret_inside_code(&self) -> bool {
+        let Some(selection) = self.text_selection() else {
+            return false;
+        };
+        match &self.pending_style {
+            Some(style) => style.code,
+            None => self
+                .document
+                .block(selection.block)
+                .is_some_and(|block| block.text.typing_style(selection.head()).code),
+        }
+    }
+
+    /// Moves the caret, when it is at an edge of inline code, to its place inside the code or
+    /// to the one outside it.
+    fn set_caret_inside_code(&mut self, inside: bool) {
+        let Some(selection) = self.text_selection() else {
+            return;
+        };
+        let position = TextPosition {
+            block: selection.block,
+            offset: selection.head(),
+        };
+        if !selection.range.is_empty() || self.code_edge(position).is_none() {
+            return;
+        }
+        if let Some(block) = self.document.block(position.block) {
+            self.pending_style = block
+                .text
+                .typing_style_at_code_edge(position.offset, inside);
+        }
     }
 
     /// Selects the text from `anchor` to `head`, which may be in different blocks.
@@ -921,9 +968,29 @@ impl Editor {
             self.set_caret(position.block, position.offset, cx);
             return;
         }
+        // An edge of inline code has two places for the caret, so it takes two steps to
+        // cross: going forward, the caret is inside the code first where the code ends, and
+        // outside it first where the code starts.
+        let inside_first =
+            |edge: CodeEdge| (edge == CodeEdge::End) == (direction == Direction::Forward);
+        if unit == Unit::Character
+            && let Some(edge) = self.code_edge(head)
+        {
+            let inside = self.caret_inside_code();
+            if inside == inside_first(edge) {
+                self.set_caret(head.block, head.offset, cx);
+                self.set_caret_inside_code(!inside);
+                return;
+            }
+        }
         if let Some((position, upstream)) = self.position_after_move(head, direction, unit) {
             self.set_caret(position.block, position.offset, cx);
             self.caret_upstream = upstream;
+            if unit == Unit::Character
+                && let Some(edge) = self.code_edge(position)
+            {
+                self.set_caret_inside_code(inside_first(edge));
+            }
         }
     }
 
@@ -997,13 +1064,13 @@ impl Editor {
         };
 
         if let Some(row) = target_row.and_then(|index| rows.get(index)) {
-            let (offset, upstream) = layout.offset_in_row(row, goal_x - layout.bounds.left());
+            let place = layout.offset_in_row(row, goal_x - layout.bounds.left());
             let position = TextPosition {
                 block: head.block,
-                offset,
+                offset: place.offset,
             };
             self.move_head(anchor, position, extend, cx);
-            self.caret_upstream = upstream;
+            self.caret_upstream = place.upstream;
             self.goal_x = Some(goal_x);
             return;
         }
@@ -1022,7 +1089,9 @@ impl Editor {
                     Direction::Forward => rows.first(),
                 };
                 row.map_or((0, false), |row| {
-                    neighbor_layout.offset_in_row(row, goal_x - neighbor_layout.bounds.left())
+                    let place =
+                        neighbor_layout.offset_in_row(row, goal_x - neighbor_layout.bounds.left());
+                    (place.offset, place.upstream)
                 })
             }
             None => (0, false),
@@ -1815,7 +1884,8 @@ impl Editor {
             self.select_block(id, cx);
             return;
         }
-        let (offset, upstream) = layout.offset_for_point(event.position);
+        let place = layout.offset_for_point(event.position);
+        let offset = place.offset;
         if event.modifiers.platform
             && let Some(link) = block.text.link_at(offset)
         {
@@ -1860,7 +1930,11 @@ impl Editor {
             }),
         };
         self.set_selection(selection, cx);
-        self.caret_upstream = upstream;
+        self.caret_upstream = place.upstream;
+        // A click next to an edge of inline code puts the caret on the side that was clicked.
+        if let Some(inside) = place.inside_code {
+            self.set_caret_inside_code(inside);
+        }
     }
 
     /// The text position that dragging the mouse to `point` selects up to, when the
@@ -1873,7 +1947,7 @@ impl Editor {
     ) -> Option<TextPosition> {
         let (id, layout) = self.block_at(point)?;
         if self.document.block(id)?.kind.has_text() {
-            let (offset, _) = layout.offset_for_point(point);
+            let offset = layout.offset_for_point(point).offset;
             return Some(TextPosition { block: id, offset });
         }
         if self.document.order(id, anchor.block)? == Ordering::Greater {
@@ -1946,12 +2020,13 @@ impl Editor {
             match &self.selection {
                 Selection::None => None,
                 Selection::Blocks { head, .. } => layouts.get(head).map(|layout| layout.bounds),
-                Selection::Text(selection) => layouts
-                    .get(&selection.block)
-                    .and_then(|layout| layout.caret_bounds(selection.head(), self.caret_upstream)),
-                Selection::Span { head, .. } => layouts
-                    .get(&head.block)
-                    .and_then(|layout| layout.caret_bounds(head.offset, self.caret_upstream)),
+                Selection::Text(selection) => layouts.get(&selection.block).and_then(|layout| {
+                    let inside_code = self.caret_inside_code();
+                    layout.caret_bounds(selection.head(), self.caret_upstream, inside_code)
+                }),
+                Selection::Span { head, .. } => layouts.get(&head.block).and_then(|layout| {
+                    layout.caret_bounds(head.offset, self.caret_upstream, false)
+                }),
             }
         };
         let Some(target) = target else {
@@ -2078,9 +2153,8 @@ impl Editor {
         span_range: Option<Range<usize>>,
         cx: &mut Context<Self>,
     ) -> BlockText {
-        let text = SharedString::from(block.text.text().to_string());
         let runs = self.text_runs(block, theme);
-        let mut element = BlockText::new(block.id, text, runs, self.layouts.clone());
+        let mut element = BlockText::new(block.id, block.text.text(), runs, self.layouts.clone());
         if let Some(selection) = self.text_selection()
             && selection.block == block.id
         {
@@ -2091,6 +2165,7 @@ impl Editor {
                 element = element.caret(Caret {
                     offset: selection.head(),
                     upstream: self.caret_upstream,
+                    inside_code: self.caret_inside_code(),
                     color: theme.caret,
                 });
             }
@@ -2607,7 +2682,7 @@ impl EntityInputHandler for Editor {
             .range_bounds(range.clone())
             .into_iter()
             .next()
-            .or_else(|| layout.caret_bounds(range.start, false))
+            .or_else(|| layout.caret_bounds(range.start, false, self.caret_inside_code()))
     }
 
     fn character_index_for_point(
@@ -2619,7 +2694,10 @@ impl EntityInputHandler for Editor {
         let selection = self.input_selection()?;
         let text = self.active_text()?.text();
         let layouts = self.layouts.borrow();
-        let (offset, _) = layouts.get(&selection.block)?.offset_for_point(point);
+        let offset = layouts
+            .get(&selection.block)?
+            .offset_for_point(point)
+            .offset;
         Some(offset_to_utf16(text, offset))
     }
 }

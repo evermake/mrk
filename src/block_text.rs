@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use gpui::{
     App, Bounds, Element, ElementId, ElementInputHandler, Entity, FocusHandle, GlobalElementId,
-    Hsla, InspectorElementId, IntoElement, LayoutId, Pixels, Point, StyledText, TextLayout, Window,
-    WrappedLineLayout, fill, point, px, size,
+    Hsla, InspectorElementId, IntoElement, LayoutId, Pixels, Point, SharedString, StyledText,
+    TextLayout, TextRun, Window, WrappedLineLayout, fill, point, px, size,
 };
 
 use crate::document::BlockId;
@@ -151,7 +151,13 @@ impl BlockLayout {
         Some(Bounds::new(origin, size(CARET_WIDTH, self.line_height)))
     }
 
+    /// The parts of the rows that `range` covers, as a selection is shown: a line break in the
+    /// range takes up some width of its own.
     pub fn range_bounds(&self, range: Range<usize>) -> Vec<Bounds<Pixels>> {
+        self.row_bounds(range, LINE_BREAK_WIDTH)
+    }
+
+    fn row_bounds(&self, range: Range<usize>, line_break_width: Pixels) -> Vec<Bounds<Pixels>> {
         let mut bounds = Vec::new();
         for (index, row) in self.rows().iter().enumerate() {
             if range.start > row.range.end || range.end < row.range.start {
@@ -162,7 +168,7 @@ impl BlockLayout {
             let left = self.x_in_row(row, start);
             let mut right = self.x_in_row(row, end);
             if !row.wraps && range.end > row.range.end {
-                right += LINE_BREAK_WIDTH;
+                right += line_break_width;
             }
             if right > left {
                 bounds.push(Bounds::new(
@@ -176,11 +182,13 @@ impl BlockLayout {
 }
 
 /// The text of one block. Wrapping and painting are delegated to [`StyledText`]; this adds
-/// the selection, the caret, text input and the record of where the text ended up.
+/// the backgrounds of the runs, the selection, the caret, text input and the record of where
+/// the text ended up.
 pub struct BlockText {
     block: BlockId,
     text: StyledText,
     layouts: LayoutMap,
+    backgrounds: Vec<(Range<usize>, Hsla)>,
     selection: Option<(Range<usize>, Hsla)>,
     caret: Option<Caret>,
     input: Option<(FocusHandle, Entity<Editor>)>,
@@ -193,11 +201,34 @@ pub struct Caret {
 }
 
 impl BlockText {
-    pub fn new(block: BlockId, text: StyledText, layouts: LayoutMap) -> Self {
+    pub fn new(
+        block: BlockId,
+        text: SharedString,
+        mut runs: Vec<TextRun>,
+        layouts: LayoutMap,
+    ) -> Self {
+        // `StyledText` paints the background of a run together with its glyphs, which would
+        // put it over the selection, so the backgrounds are taken out to be painted under it.
+        let mut backgrounds: Vec<(Range<usize>, Hsla)> = Vec::new();
+        let mut offset = 0;
+        for run in &mut runs {
+            let range = offset..offset + run.len;
+            offset = range.end;
+            let Some(color) = run.background_color.take() else {
+                continue;
+            };
+            match backgrounds.last_mut() {
+                Some((last, last_color)) if last.end == range.start && *last_color == color => {
+                    last.end = range.end;
+                }
+                _ => backgrounds.push((range, color)),
+            }
+        }
         Self {
             block,
-            text,
+            text: StyledText::new(text).with_runs(runs),
             layouts,
+            backgrounds,
             selection: None,
             caret: None,
             input: None,
@@ -276,6 +307,11 @@ impl Element for BlockText {
         cx: &mut App,
     ) {
         let layout = BlockLayout::new(self.text.layout());
+        for (range, color) in &self.backgrounds {
+            for background in layout.row_bounds(range.clone(), Pixels::ZERO) {
+                window.paint_quad(fill(background, *color));
+            }
+        }
         if let Some((range, color)) = &self.selection {
             for selected in layout.range_bounds(range.clone()) {
                 window.paint_quad(fill(selected, *color));
